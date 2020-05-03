@@ -1,50 +1,62 @@
-use async_recursion::async_recursion;
-use async_std::fs;
+use async_std::fs::{self, DirEntry};
 use async_std::path::Path;
 use async_std::prelude::*;
-use async_std::task;
-use std::cmp::Eq;
+use futures::{
+    executor,
+    future::{Future, FutureExt, LocalBoxFuture},
+};
 use std::collections::HashMap;
-use std::error::Error;
-use std::hash::Hash;
+use std::fmt::Debug;
+use std::hash::Hash; // 0.3.4
 
-pub type HashFnameMap<T> = HashMap<T, Vec<String>>;
-pub type HashFn<T> = dyn Fn(&[u8]) -> T + Send + Sync + 'static;
+pub type HashFNameMap<T> = HashMap<T, Vec<String>>;
 
-#[async_recursion]
-pub async fn md5_file_map<'a, T>(
-    map: &'a mut HashFnameMap<T>,
-    path: &Path,
-    hash_fn: &HashFn<T>,
-) -> Result<&'a mut HashFnameMap<T>, Box<dyn Error>>
+pub fn run_hash_files<T, U>(path: impl AsRef<Path>, hash_fn: impl FnMut(DirEntry) -> T)
 where
-    T: Hash + Eq + Send + Sync,
+    T: Future<Output = U>,
+    U: Hash + Send + Sync + Debug,
 {
-    println!("{:?}", path.file_name());
-    let mut entries = fs::read_dir(path).await?;
-    while let Some(entry) = entries.next().await {
-        let next_path = entry?.path();
-        if next_path.is_dir().await {
-            md5_file_map(map, next_path.as_path(), hash_fn).await?;
-        } else {
-            let fcontents = fs::read(&next_path).await?;
-            let fdigest = hash_fn(&fcontents[..]);
-            let entry = map.entry(fdigest).or_insert(Vec::new());
-            entry.push(format!("{}", next_path.as_path().to_str().unwrap()));
+    async fn hash_files<T, U>(path: impl AsRef<Path>, mut hash_fn: impl FnMut(DirEntry) -> T)
+    where
+        T: Future<Output = U>,
+        U: Hash + Send + Sync + Debug,
+    {
+        fn inner_fn<'a, T, U>(
+            path: &'a Path,
+            hash_fn: &'a mut dyn FnMut(DirEntry) -> T,
+        ) -> LocalBoxFuture<'a, ()>
+        where
+            T: Future<Output = U>,
+            U: Hash + Send + Sync + Debug,
+        {
+            async move {
+                let mut entries = fs::read_dir(path).await.unwrap();
+                while let Some(path) = entries.next().await {
+                    let entry = path.unwrap();
+                    let path = entry.path();
+                    if path.is_file().await {
+                        let hash = hash_fn(entry).await;
+                        println!("{:?}", hash);
+                    } else {
+                        inner_fn(&path, hash_fn).await
+                    }
+                }
+            }
+            .boxed_local()
         }
+        inner_fn(path.as_ref(), &mut hash_fn).await
     }
-    Ok(map)
+    executor::block_on({ hash_files(path, hash_fn) });
 }
 
 mod test {
     use super::*;
-    use md5;
 
     #[test]
     fn test_md5_file_map() {
-        let mut fhm: HashFnameMap<md5::Digest> = HashMap::new();
-        let path = Path::new("./target");
-        task::block_on(md5_file_map(&mut fhm, &path, &|e: &[u8]| md5::compute(e))).unwrap();
-        println!("{:#?}", fhm);
+        run_hash_files(Path::new("./target"), |entry| async move {
+            let contents = fs::read(entry.path()).await;
+            md5::compute(contents.unwrap())
+        })
     }
 }
