@@ -4,12 +4,13 @@ use async_std::path::Path;
 use async_std::prelude::*;
 use async_std::task;
 use futures::future::Future;
-use std::cmp::Eq;
+use std::cmp::{Eq, Ord};
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::Debug;
 use std::hash::Hash;
-use std::sync::mpsc;
+use std::sync::mpsc::{self, Sender, Receiver};
+use futures::join;
 
 pub type HashFnameMap<T> = HashMap<T, Vec<String>>;
 pub struct FileHash<T: Hash + Eq + Send + Sync>(Option<T>, Option<String>);
@@ -40,6 +41,32 @@ where
     Ok(())
 }
 
+async fn md5_hash_files<C>(path: impl AsRef<Path>, mut cb: C)
+where C: FnMut(HashFnameMap<md5::Digest>) + Send + Sync + 'static
+{
+        let (sender, receiver): (Sender<FileHash<md5::Digest>>, Receiver<FileHash<md5::Digest>>)  = mpsc::channel();
+
+        let mut hash_fname_map: HashFnameMap<md5::Digest> = HashMap::new();
+
+        let reader_handle = task::spawn(async move {
+            while let Ok(ref mut file_hash) = receiver.recv() {
+                let key = file_hash.0.take().unwrap();
+                let val = file_hash.1.take().unwrap();
+                let entry = hash_fname_map.entry(key).or_insert(Vec::new());
+                entry.push(val);
+            }
+            cb(hash_fname_map);
+        });
+
+        futures::join!(
+            reader_handle,
+            hash_files(sender, &path, &|e: DirEntry| async move {
+                let contents = fs::read(e.path()).await.unwrap();
+                md5::compute(contents)
+            })
+        ).1.unwrap();
+}
+
 mod test {
     use super::*;
     use md5;
@@ -47,20 +74,11 @@ mod test {
     #[test]
     fn test_md5_file_map() {
         let path = Path::new("./target");
-        let (sender, receiver) = mpsc::channel();
-        task::block_on(hash_files(sender, &path, &|e: DirEntry| async move {
-            let contents = fs::read(e.path()).await.unwrap();
-            md5::compute(contents)
-        }))
-        .unwrap();
-
-        let mut hash_fname_map: HashFnameMap<md5::Digest> = HashMap::new();
-        while let Some(file_hash) = receiver.recv().iter_mut().next() {
-            let key = file_hash.0.take().unwrap();
-            let val = file_hash.1.take().unwrap();
-            let entry = hash_fname_map.entry(key).or_insert(Vec::new());
-            entry.push(val);
-        }
-        println!("{:#?}", hash_fname_map);
+        task::block_on(md5_hash_files(path, |hfm| {
+            for (k, v) in hfm.iter() {
+                println!("{:?}, {:#?}", k, v);
+            }
+        }));
+        // println!("{:#?}", hash_fname_map);
     }
 }
