@@ -39,8 +39,7 @@ where
     Ok(())
 }
 
-pub async fn count_files<C>(path: impl AsRef<Path>, mut cb: C)
-where C: FnMut(Result<u64, Box<dyn Error + Send>>) + Send + Sync + 'static
+pub async fn count_files(path: impl AsRef<Path>) -> Result<u64, Box<dyn Error>>
 {
     let (sender, receiver): (Sender<u64>, Receiver<u64>)  = mpsc::channel();
     let mut total_count = 0u64;
@@ -49,21 +48,25 @@ where C: FnMut(Result<u64, Box<dyn Error + Send>>) + Send + Sync + 'static
         while let Ok(n) = receiver.recv() {
             total_count += n;
         }
-        cb(Ok(total_count));
+        total_count
     });
 
     let writer_handle = recursive_file_map(sender, &path, &|_: DirEntry| async move {
         1u64
     });
 
-    futures::join!(
+    let results = futures::join!(
         reader_handle,
         writer_handle
-    ).1.unwrap();
+    );
+    println!("total count: {}", results.0);
+    Ok(results.0)
 }
 
-pub async fn md5_hash_files<C>(path: impl AsRef<Path>, mut cb: C)
-where C: FnMut(Result<HashFNameResult<md5::Digest>, Box<dyn Error + Send>>) + Send + Sync + 'static
+pub async fn md5_hash_files<C, D>(path: impl AsRef<Path>, mut cb: C, mut loop_cb: D)
+where
+    C: FnMut(Result<HashFNameResult<md5::Digest>, Box<dyn Error + Send>>) + Send + Sync + 'static,
+    D: FnMut() + Send + Sync + 'static
 {
     let (sender, receiver): (Sender<FileHash<md5::Digest>>, Receiver<FileHash<md5::Digest>>)  = mpsc::channel();
     let mut hash_fname_map: HashFNameMap<md5::Digest> = HashMap::new();
@@ -74,6 +77,7 @@ where C: FnMut(Result<HashFNameResult<md5::Digest>, Box<dyn Error + Send>>) + Se
             let val = file_hash.1.take().unwrap();
             let entry = hash_fname_map.entry(key).or_insert(Vec::new());
             entry.push(val);
+            loop_cb();
         }
         for v in hash_fname_map.values_mut() {
             v.sort();
@@ -133,15 +137,14 @@ mod test {
     ),
 ]"#;
             assert_eq!(format!("{:#?}", got.unwrap()), want);
-        }));
+        }, || {}));
         // println!("{:#?}", hash_fname_map);
     }
 
     #[test]
     fn test_count_files() {
         let path = Path::new("./test_fixtures");
-        task::block_on(count_files(path, |got| {
-            assert_eq!(6u64, got.unwrap());
-        }));
+        let got = task::block_on(count_files(path));
+        assert_eq!(6u64, got.unwrap());
     }
 }
