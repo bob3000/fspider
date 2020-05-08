@@ -1,6 +1,6 @@
 use async_recursion::async_recursion;
 use async_std::fs::{self, DirEntry};
-use async_std::path::Path;
+use async_std::path::{Path};
 use async_std::prelude::*;
 use async_std::task;
 use futures::future::Future;
@@ -11,9 +11,11 @@ use std::hash::Hash;
 use std::sync::mpsc::{self, Sender, Receiver};
 use futures::join;
 
-pub type HashFNameMap<T> = HashMap<T, Vec<String>>;
-pub type HashFNameResult<T> = Vec<(T, Vec<String>)>;
-pub struct FileHash<T: Hash + Eq + Send + Sync>(Option<T>, Option<String>);
+pub type HashFNameMap<T> = HashMap<T, Vec<DirEntry>>;
+pub type HashFNameResult<T> = Vec<(T, Vec<DirEntry>)>;
+
+#[derive(Debug)]
+pub struct FileHash<T: Hash + Eq + Send + Sync>(Option<T>, Option<DirEntry>);
 
 #[async_recursion(?Send)]
 pub async fn recursive_file_map<T, F>(
@@ -80,18 +82,19 @@ where
             loop_cb();
         }
         for v in hash_fname_map.values_mut() {
-            v.sort();
+            v.sort_by(|a, b| {
+                a.path().partial_cmp(&b.path()).unwrap()
+            });
         }
         let mut result: HashFNameResult<md5::Digest> = hash_fname_map.into_iter().collect();
-        result.sort_by(|a, b| a.1[0].cmp(&b.1[0]));
+        result.sort_by(|a, b| a.1[0].path().cmp(&b.1[0].path()));
         cb(Ok(result));
     });
 
     let writer_handle = recursive_file_map(sender, &path, &|e: DirEntry| async move {
         let contents = fs::read(e.path()).await.unwrap();
         let fdigest = md5::compute(contents);
-        let fname = format!("{}", e.path().to_str().unwrap());
-        FileHash(Some(fdigest), Some(fname))
+        FileHash(Some(fdigest), Some(e))
     });
 
     futures::join!(
