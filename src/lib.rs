@@ -39,37 +39,61 @@ where
     Ok(())
 }
 
-pub async fn md5_hash_files<C>(path: impl AsRef<Path>, mut cb: C)
-where C: FnMut(HashFNameResult<md5::Digest>) + Send + Sync + 'static
+pub async fn count_files<C>(path: impl AsRef<Path>, mut cb: C)
+where C: FnMut(Result<u64, Box<dyn Error + Send>>) + Send + Sync + 'static
 {
-        let (sender, receiver): (Sender<FileHash<md5::Digest>>, Receiver<FileHash<md5::Digest>>)  = mpsc::channel();
+    let (sender, receiver): (Sender<u64>, Receiver<u64>)  = mpsc::channel();
+    let mut total_count = 0u64;
 
-        let mut hash_fname_map: HashFNameMap<md5::Digest> = HashMap::new();
+    let reader_handle = task::spawn(async move {
+        while let Ok(n) = receiver.recv() {
+            total_count += n;
+        }
+        cb(Ok(total_count));
+    });
 
-        let reader_handle = task::spawn(async move {
-            while let Ok(ref mut file_hash) = receiver.recv() {
-                let key = file_hash.0.take().unwrap();
-                let val = file_hash.1.take().unwrap();
-                let entry = hash_fname_map.entry(key).or_insert(Vec::new());
-                entry.push(val);
-            }
-            for v in hash_fname_map.values_mut() {
-                v.sort();
-            }
-            let mut result: HashFNameResult<md5::Digest> = hash_fname_map.into_iter().collect();
-            result.sort_by(|a, b| a.1[0].cmp(&b.1[0]));
-            cb(result);
-        });
+    let writer_handle = recursive_file_map(sender, &path, &|_: DirEntry| async move {
+        1u64
+    });
 
-        futures::join!(
-            reader_handle,
-            recursive_file_map(sender, &path, &|e: DirEntry| async move {
-                let contents = fs::read(e.path()).await.unwrap();
-                let fdigest = md5::compute(contents);
-                let fname = format!("{}", e.path().to_str().unwrap());
-                FileHash(Some(fdigest), Some(fname))
-            })
-        ).1.unwrap();
+    futures::join!(
+        reader_handle,
+        writer_handle
+    ).1.unwrap();
+}
+
+pub async fn md5_hash_files<C>(path: impl AsRef<Path>, mut cb: C)
+where C: FnMut(Result<HashFNameResult<md5::Digest>, Box<dyn Error + Send>>) + Send + Sync + 'static
+{
+    let (sender, receiver): (Sender<FileHash<md5::Digest>>, Receiver<FileHash<md5::Digest>>)  = mpsc::channel();
+    let mut hash_fname_map: HashFNameMap<md5::Digest> = HashMap::new();
+
+    let reader_handle = task::spawn(async move {
+        while let Ok(ref mut file_hash) = receiver.recv() {
+            let key = file_hash.0.take().unwrap();
+            let val = file_hash.1.take().unwrap();
+            let entry = hash_fname_map.entry(key).or_insert(Vec::new());
+            entry.push(val);
+        }
+        for v in hash_fname_map.values_mut() {
+            v.sort();
+        }
+        let mut result: HashFNameResult<md5::Digest> = hash_fname_map.into_iter().collect();
+        result.sort_by(|a, b| a.1[0].cmp(&b.1[0]));
+        cb(Ok(result));
+    });
+
+    let writer_handle = recursive_file_map(sender, &path, &|e: DirEntry| async move {
+        let contents = fs::read(e.path()).await.unwrap();
+        let fdigest = md5::compute(contents);
+        let fname = format!("{}", e.path().to_str().unwrap());
+        FileHash(Some(fdigest), Some(fname))
+    });
+
+    futures::join!(
+        reader_handle,
+        writer_handle
+    ).1.unwrap();
 }
 
 mod test {
@@ -108,8 +132,16 @@ mod test {
         ],
     ),
 ]"#;
-            assert_eq!(format!("{:#?}", got), want);
+            assert_eq!(format!("{:#?}", got.unwrap()), want);
         }));
         // println!("{:#?}", hash_fname_map);
+    }
+
+    #[test]
+    fn test_count_files() {
+        let path = Path::new("./test_fixtures");
+        task::block_on(count_files(path, |got| {
+            assert_eq!(6u64, got.unwrap());
+        }));
     }
 }
