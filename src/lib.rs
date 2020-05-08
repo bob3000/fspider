@@ -4,10 +4,9 @@ use async_std::path::Path;
 use async_std::prelude::*;
 use async_std::task;
 use futures::future::Future;
-use std::cmp::{Eq, Ord, Ordering};
+use std::cmp::Eq;
 use std::collections::HashMap;
 use std::error::Error;
-use std::fmt::Debug;
 use std::hash::Hash;
 use std::sync::mpsc::{self, Sender, Receiver};
 use futures::join;
@@ -17,26 +16,24 @@ pub type HashFNameResult<T> = Vec<(T, Vec<String>)>;
 pub struct FileHash<T: Hash + Eq + Send + Sync>(Option<T>, Option<String>);
 
 #[async_recursion(?Send)]
-pub async fn hash_files<T, F>(
-    sender: mpsc::Sender<FileHash<T>>,
+pub async fn recursive_file_map<T, F>(
+    sender: mpsc::Sender<T>,
     path: impl AsRef<Path> + 'async_recursion,
-    hash_fn: &'async_recursion dyn Fn(DirEntry) -> F,
+    map_fn: &'async_recursion dyn Fn(DirEntry) -> F,
 ) -> Result<(), Box<dyn Error + Send>>
 where
-    T: Hash + Eq + Send + Sync + Debug,
+    T: Send + Sync,
     F: Future<Output = T>,
 {
     let mut entries = fs::read_dir(path).await.unwrap();
     while let Some(entry) = entries.next().await {
         let next_path = entry.as_ref().unwrap().path();
         if next_path.is_dir().await {
-            hash_files(sender.clone(), next_path.as_path(), &hash_fn)
+            recursive_file_map(sender.clone(), next_path.as_path(), &map_fn)
                 .await
                 .unwrap();
         } else {
-            let fname = format!("{}", next_path.as_path().to_str().unwrap());
-            let fdigest = hash_fn(entry.unwrap()).await;
-            sender.send(FileHash(Some(fdigest), Some(fname))).unwrap();
+            sender.send(map_fn(entry.unwrap()).await).unwrap();
         }
     }
     Ok(())
@@ -64,12 +61,13 @@ where C: FnMut(HashFNameResult<md5::Digest>) + Send + Sync + 'static
             cb(result);
         });
 
-
         futures::join!(
             reader_handle,
-            hash_files(sender, &path, &|e: DirEntry| async move {
+            recursive_file_map(sender, &path, &|e: DirEntry| async move {
                 let contents = fs::read(e.path()).await.unwrap();
-                md5::compute(contents)
+                let fdigest = md5::compute(contents);
+                let fname = format!("{}", e.path().to_str().unwrap());
+                FileHash(Some(fdigest), Some(fname))
             })
         ).1.unwrap();
 }
