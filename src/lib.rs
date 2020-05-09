@@ -12,10 +12,15 @@ use std::sync::mpsc::{self, Sender, Receiver};
 use futures::join;
 
 pub type HashFNameMap<T> = HashMap<T, Vec<DirEntry>>;
-pub type HashFNameResult<T> = Vec<(T, Vec<DirEntry>)>;
+pub type SortedFNames<T> = Vec<(T, Vec<DirEntry>)>;
 
 #[derive(Debug)]
 pub struct FileHash<T: Hash + Eq + Send + Sync>(Option<T>, Option<DirEntry>);
+
+pub enum SortOrder {
+    Alphanumeric,
+    Size,
+}
 
 #[async_recursion(?Send)]
 pub async fn recursive_file_map<T, F>(
@@ -65,10 +70,10 @@ pub async fn count_files(path: impl AsRef<Path>) -> Result<u64, Box<dyn Error>>
     Ok(results.0)
 }
 
-pub async fn md5_hash_files<C, D>(path: impl AsRef<Path>, mut cb: C, mut loop_cb: D)
+pub async fn md5_hash_files<C>(path: impl AsRef<Path>, mut loop_cb: C
+) -> Result<HashFNameMap<md5::Digest>, Box<dyn Error + Send>>
 where
-    C: FnMut(Result<HashFNameResult<md5::Digest>, Box<dyn Error + Send>>) + Send + Sync + 'static,
-    D: FnMut() + Send + Sync + 'static
+    C: FnMut() + Send + Sync + 'static
 {
     let (sender, receiver): (Sender<FileHash<md5::Digest>>, Receiver<FileHash<md5::Digest>>)  = mpsc::channel();
     let mut hash_fname_map: HashFNameMap<md5::Digest> = HashMap::new();
@@ -86,9 +91,7 @@ where
                 a.path().partial_cmp(&b.path()).unwrap()
             });
         }
-        let mut result: HashFNameResult<md5::Digest> = hash_fname_map.into_iter().collect();
-        result.sort_by(|a, b| a.1[0].path().cmp(&b.1[0].path()));
-        cb(Ok(result));
+        hash_fname_map
     });
 
     let writer_handle = recursive_file_map(sender, &path, &|e: DirEntry| async move {
@@ -97,10 +100,26 @@ where
         FileHash(Some(fdigest), Some(e))
     });
 
-    futures::join!(
+    let retval = futures::join!(
         reader_handle,
         writer_handle
-    ).1.unwrap();
+    );
+    Ok(retval.0)
+}
+
+pub fn sort_hash_fname<T>(hfm: HashFNameMap<T>, order: SortOrder) -> SortedFNames<T> {
+    let mut tuples: SortedFNames<T> = hfm.into_iter().collect();
+
+    match order {
+        SortOrder::Size => tuples.sort_by(|a, b| {
+                                let meta_a = task::block_on(a.1[0].metadata()).unwrap();
+                                let meta_b = task::block_on(b.1[0].metadata()).unwrap();
+                                meta_a.len().cmp(&meta_b.len())
+        }),
+        SortOrder::Alphanumeric => tuples.sort_by(|a, b| {
+            a.1[0].path().cmp(&b.1[0].path())}),
+    }
+    tuples
 }
 
 mod test {
@@ -110,38 +129,62 @@ mod test {
     #[test]
     fn test_md5_file_map() {
         let path = Path::new("./test_fixtures");
-        task::block_on(md5_hash_files(path, |got| {
-            let want = r#"[
+        let got = task::block_on(md5_hash_files(path, || {})).unwrap();
+        let sorted_tuples = sort_hash_fname(got, SortOrder::Alphanumeric);
+        let want = r#"[
     (
         8c357cff93cddd4412996e178ba3f426,
         [
-            "./test_fixtures/alpha/a",
+            DirEntry(
+                PathBuf {
+                    inner: "./test_fixtures/alpha/a",
+                },
+            ),
         ],
     ),
     (
         40042c928f411964c8d542874c8c4fb8,
         [
-            "./test_fixtures/alpha/b",
-            "./test_fixtures/alpha/bravo/charlie/b",
+            DirEntry(
+                PathBuf {
+                    inner: "./test_fixtures/alpha/b",
+                },
+            ),
+            DirEntry(
+                PathBuf {
+                    inner: "./test_fixtures/alpha/bravo/charlie/b",
+                },
+            ),
         ],
     ),
     (
         059f99d9af988b464474f5a7815c7e22,
         [
-            "./test_fixtures/alpha/bravo/charlie/c",
+            DirEntry(
+                PathBuf {
+                    inner: "./test_fixtures/alpha/bravo/charlie/c",
+                },
+            ),
         ],
     ),
     (
         55179001e96aceaf7cf5cad3e2ff8873,
         [
-            "./test_fixtures/alpha/bravo/charlie/d",
-            "./test_fixtures/alpha/bravo/d",
+            DirEntry(
+                PathBuf {
+                    inner: "./test_fixtures/alpha/bravo/charlie/d",
+                },
+            ),
+            DirEntry(
+                PathBuf {
+                    inner: "./test_fixtures/alpha/bravo/d",
+                },
+            ),
         ],
     ),
 ]"#;
-            assert_eq!(format!("{:#?}", got.unwrap()), want);
-        }, || {}));
-        // println!("{:#?}", hash_fname_map);
+        assert_eq!(format!("{:#?}", sorted_tuples), want);
+        // println!("{:#?}", sorted_tuples);
     }
 
     #[test]
