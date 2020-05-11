@@ -1,6 +1,5 @@
 mod lib;
 use async_std::task;
-use async_std::fs::DirEntry;
 use structopt::StructOpt;
 use std::path::PathBuf;
 use indicatif::ProgressBar;
@@ -19,20 +18,13 @@ fn main() {
     let num_files = task::block_on(lib::count_files(&args.path)).unwrap();
 
     let progress = ProgressBar::new(num_files);
-    task::block_on(
-        lib::md5_hash_files(&args.path, |hf| {
-            let results: Vec<Vec<DirEntry>> = hf.unwrap().into_iter().filter(|(_, v)| {
-                v.len() > 1
-            })
-            .map(|(_, v)| v)
-            .collect();
+    let hf = task::block_on( lib::md5_hash_files(&args.path, move || {progress.inc(1)})).unwrap();
+    let results: lib::DupVec = hf.duplicates().sort(lib::SortOrder::Size);
 
-            for res in results.iter() {
-                for duplicate in res.iter() {
-                    println!("{}", duplicate.path().to_str().unwrap());
-                }
-                println!();
-            }
-        }, move || {progress.inc(1)})
-    );
+    for res in results.into_inner().iter() {
+        for duplicate in res.iter() {
+            println!("{}", duplicate.path().to_str().unwrap());
+        }
+        println!();
+    }
 }

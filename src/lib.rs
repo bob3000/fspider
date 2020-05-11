@@ -11,8 +11,8 @@ use std::hash::Hash;
 use std::sync::mpsc::{self, Sender, Receiver};
 use futures::join;
 
-pub type HashFNameMap<T> = HashMap<T, Vec<DirEntry>>;
-pub type SortedFNames<T> = Vec<(T, Vec<DirEntry>)>;
+pub type HashFNameMapInner<T> = HashMap<T, Vec<DirEntry>>;
+pub type DupVecInner = Vec<Vec<DirEntry>>;
 
 #[derive(Debug)]
 pub struct FileHash<T: Hash + Eq + Send + Sync>(Option<T>, Option<DirEntry>);
@@ -20,6 +20,46 @@ pub struct FileHash<T: Hash + Eq + Send + Sync>(Option<T>, Option<DirEntry>);
 pub enum SortOrder {
     Alphanumeric,
     Size,
+}
+
+#[derive(Debug)]
+pub struct DupVec {
+    inner: Vec<Vec<DirEntry>>,
+}
+
+impl DupVec {
+    pub fn sort(mut self, order: SortOrder) -> DupVec {
+        match order {
+            SortOrder::Size =>
+                self.inner.sort_by(|a, b| {
+                                    let meta_a = task::block_on(a[0].metadata()).unwrap();
+                                    let meta_b = task::block_on(b[0].metadata()).unwrap();
+                                    meta_a.len().cmp(&meta_b.len())
+            }),
+            SortOrder::Alphanumeric => self.inner.sort_by(|a, b| {
+                a[0].path().cmp(&b[0].path())}),
+        }
+        self
+    }
+
+    pub fn into_inner(self) -> DupVecInner {
+        self.inner
+    }
+}
+
+pub struct HashFNameMap<T> {
+    inner: HashFNameMapInner<T>,
+ }
+
+impl<T: Hash + Eq> HashFNameMap<T> {
+    pub fn new() -> Self {
+        Self{ inner: HashMap::new() }
+    }
+
+    pub fn duplicates(self) -> DupVec {
+        let inner = self.inner.into_iter().filter(|(_, v)| v.len() > 1).map(|(_, v)| v).collect::<DupVecInner>(); //.collect::<Vec<(T, Vec<DirEntry>)>>().values()
+        DupVec { inner }
+    }
 }
 
 #[async_recursion(?Send)]
@@ -76,17 +116,17 @@ where
     C: FnMut() + Send + Sync + 'static
 {
     let (sender, receiver): (Sender<FileHash<md5::Digest>>, Receiver<FileHash<md5::Digest>>)  = mpsc::channel();
-    let mut hash_fname_map: HashFNameMap<md5::Digest> = HashMap::new();
+    let mut hash_fname_map: HashFNameMap<md5::Digest> = HashFNameMap::new();
 
     let reader_handle = task::spawn(async move {
         while let Ok(ref mut file_hash) = receiver.recv() {
             let key = file_hash.0.take().unwrap();
             let val = file_hash.1.take().unwrap();
-            let entry = hash_fname_map.entry(key).or_insert(Vec::new());
+            let entry = hash_fname_map.inner.entry(key).or_insert(Vec::new());
             entry.push(val);
             loop_cb();
         }
-        for v in hash_fname_map.values_mut() {
+        for v in hash_fname_map.inner.values_mut() {
             v.sort_by(|a, b| {
                 a.path().partial_cmp(&b.path()).unwrap()
             });
@@ -107,30 +147,53 @@ where
     Ok(retval.0)
 }
 
-pub fn sort_hash_fname<T>(hfm: HashFNameMap<T>, order: SortOrder) -> SortedFNames<T> {
-    let mut tuples: SortedFNames<T> = hfm.into_iter().collect();
-
-    match order {
-        SortOrder::Size => tuples.sort_by(|a, b| {
-                                let meta_a = task::block_on(a.1[0].metadata()).unwrap();
-                                let meta_b = task::block_on(b.1[0].metadata()).unwrap();
-                                meta_a.len().cmp(&meta_b.len())
-        }),
-        SortOrder::Alphanumeric => tuples.sort_by(|a, b| {
-            a.1[0].path().cmp(&b.1[0].path())}),
-    }
-    tuples
-}
-
 mod test {
     use super::*;
     use md5;
 
     #[test]
+    fn test_dup_vec() {
+        let path = Path::new("./test_fixtures");
+        let got = task::block_on(md5_hash_files(path, || {})).unwrap().duplicates().sort(SortOrder::Size);
+        let want = r#"DupVec {
+    inner: [
+        [
+            DirEntry(
+                PathBuf {
+                    inner: "./test_fixtures/alpha/b",
+                },
+            ),
+            DirEntry(
+                PathBuf {
+                    inner: "./test_fixtures/alpha/bravo/charlie/b",
+                },
+            ),
+        ],
+        [
+            DirEntry(
+                PathBuf {
+                    inner: "./test_fixtures/alpha/bravo/charlie/d",
+                },
+            ),
+            DirEntry(
+                PathBuf {
+                    inner: "./test_fixtures/alpha/bravo/d",
+                },
+            ),
+        ],
+    ],
+}"#;
+
+        // println!("{:#?}", got);
+        assert_eq!(format!("{:#?}", got), want);
+    }
+
+    #[test]
     fn test_md5_file_map() {
         let path = Path::new("./test_fixtures");
         let got = task::block_on(md5_hash_files(path, || {})).unwrap();
-        let sorted_tuples = sort_hash_fname(got, SortOrder::Alphanumeric);
+        let mut tuples: Vec<(md5::Digest, Vec<DirEntry>)> = got.inner.into_iter().collect();
+        tuples.sort_by(|a, b| format!("{:?}", a.1[0]).cmp(&format!("{:?}", b.1[0])));
         let want = r#"[
     (
         8c357cff93cddd4412996e178ba3f426,
@@ -183,8 +246,8 @@ mod test {
         ],
     ),
 ]"#;
-        assert_eq!(format!("{:#?}", sorted_tuples), want);
-        // println!("{:#?}", sorted_tuples);
+        assert_eq!(format!("{:#?}", tuples), want);
+        // println!("{:#?}", tuples);
     }
 
     #[test]
