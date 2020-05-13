@@ -1,0 +1,50 @@
+{
+  // Use IntelliSense to learn about possible attributes.
+  // Hover to view descriptions of existing attributes.
+  // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug unit tests in library 'fspider'",
+      "cargo": {
+        "args": ["test", "--no-run", "--lib", "--package=fspider"],
+        "filter": {
+          "name": "fspider",
+          "kind": "lib"
+        }
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug executable 'fspider'",
+      "cargo": {
+        "args": ["build", "--bin=fspider", "--package=fspider"],
+        "filter": {
+          "name": "fspider",
+          "kind": "bin"
+        }
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug unit tests in executable 'fspider'",
+      "cargo": {
+        "args": ["test", "--no-run", "--bin=fspider", "--package=fspider"],
+        "filter": {
+          "name": "fspider",
+          "kind": "bin"
+        }
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}"
+    }
+  ]
+}
