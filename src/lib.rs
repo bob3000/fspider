@@ -1,8 +1,9 @@
 use async_recursion::async_recursion;
-use async_std::fs::{self, DirEntry};
+use async_std::fs::{self, DirEntry, File};
 use async_std::path::{Path};
 use async_std::prelude::*;
 use async_std::task;
+use async_std::io::BufReader;
 use futures::future::Future;
 use std::cmp::Eq;
 use std::collections::HashMap;
@@ -66,6 +67,7 @@ impl<T: Hash + Eq> HashFNameMap<T> {
 pub async fn recursive_file_map<T, F>(
     sender: mpsc::Sender<T>,
     path: impl AsRef<Path> + 'async_recursion,
+    mut max_depth: i16,
     map_fn: &'async_recursion dyn Fn(DirEntry) -> F,
 ) -> Result<(), Box<dyn Error + Send>>
 where
@@ -74,9 +76,11 @@ where
 {
     let mut entries = fs::read_dir(path).await.unwrap();
     while let Some(entry) = entries.next().await {
+        if max_depth == 0 { break; } else { max_depth -= 1 };
         let next_path = entry.as_ref().unwrap().path();
+
         if next_path.is_dir().await {
-            recursive_file_map(sender.clone(), next_path.as_path(), &map_fn)
+            recursive_file_map(sender.clone(), next_path.as_path(), max_depth, &map_fn)
                 .await
                 .unwrap();
         } else {
@@ -86,7 +90,7 @@ where
     Ok(())
 }
 
-pub async fn count_files(path: impl AsRef<Path>) -> Result<u64, Box<dyn Error>>
+pub async fn count_files(path: impl AsRef<Path>, max_depth: i16) -> Result<u64, Box<dyn Error>>
 {
     let (sender, receiver): (Sender<u64>, Receiver<u64>)  = mpsc::channel();
     let mut total_count = 0u64;
@@ -98,7 +102,7 @@ pub async fn count_files(path: impl AsRef<Path>) -> Result<u64, Box<dyn Error>>
         total_count
     });
 
-    let writer_handle = recursive_file_map(sender, &path, &|_: DirEntry| async move {
+    let writer_handle = recursive_file_map(sender, &path, max_depth, &|_: DirEntry| async move {
         1u64
     });
 
@@ -110,7 +114,13 @@ pub async fn count_files(path: impl AsRef<Path>) -> Result<u64, Box<dyn Error>>
     Ok(results.0)
 }
 
-pub async fn md5_hash_files<C>(path: impl AsRef<Path>, mut loop_cb: C
+#[derive(Copy, Clone, Debug)]
+pub struct MD5HashFileOpts {
+    pub max_depth: i16,
+    pub read_buf_size: usize,
+}
+
+pub async fn md5_hash_files<C>(path: impl AsRef<Path>, opts: MD5HashFileOpts, mut loop_cb: C
 ) -> Result<HashFNameMap<md5::Digest>, Box<dyn Error + Send>>
 where
     C: FnMut() + Send + Sync + 'static
@@ -134,11 +144,22 @@ where
         hash_fname_map
     });
 
-    let writer_handle = recursive_file_map(sender, &path, &|e: DirEntry| async move {
-        let contents = fs::read(e.path()).await.unwrap();
-        let fdigest = md5::compute(contents);
+    let hash_file_fn = &|e: DirEntry| async move {
+        let f_handle = File::open(e.path()).await.unwrap();
+        let mut read_buf = vec![0; opts.read_buf_size];
+        let mut buf_reader = BufReader::with_capacity(opts.read_buf_size, f_handle);
+        let mut fdigest = md5::compute("");
+        while 0 <  buf_reader.read(&mut read_buf[..]).await.unwrap() {
+            let mut to_hash: Vec<u8> = Vec::with_capacity(read_buf.len() + fdigest.0.len());
+            to_hash.append(&mut fdigest.0.to_vec());
+            to_hash.append(&mut read_buf);
+            fdigest = md5::compute(to_hash);
+        }
+
         FileHash(Some(fdigest), Some(e))
-    });
+    };
+
+    let writer_handle = recursive_file_map(sender, &path, opts.max_depth, hash_file_fn);
 
     let retval = futures::join!(
         reader_handle,
@@ -154,7 +175,8 @@ mod test {
     #[test]
     fn test_dup_vec() {
         let path = Path::new("./test_fixtures");
-        let got = task::block_on(md5_hash_files(path, || {})).unwrap().duplicates().sort(SortOrder::Size);
+        let opts = MD5HashFileOpts{ max_depth: -1, read_buf_size: 256 };
+        let got = task::block_on(md5_hash_files(path, opts, || {})).unwrap().duplicates().sort(SortOrder::Size);
         let want = r#"DupVec {
     inner: [
         [
@@ -191,12 +213,13 @@ mod test {
     #[test]
     fn test_md5_file_map() {
         let path = Path::new("./test_fixtures");
-        let got = task::block_on(md5_hash_files(path, || {})).unwrap();
+        let opts = MD5HashFileOpts{ max_depth: -1, read_buf_size: 256 };
+        let got = task::block_on(md5_hash_files(path, opts, || {})).unwrap();
         let mut tuples: Vec<(md5::Digest, Vec<DirEntry>)> = got.inner.into_iter().collect();
         tuples.sort_by(|a, b| format!("{:?}", a.1[0]).cmp(&format!("{:?}", b.1[0])));
         let want = r#"[
     (
-        8c357cff93cddd4412996e178ba3f426,
+        d475703402a752e7cf1c94562b0998ee,
         [
             DirEntry(
                 PathBuf {
@@ -206,7 +229,7 @@ mod test {
         ],
     ),
     (
-        40042c928f411964c8d542874c8c4fb8,
+        036fb9ab9b5c7b72c7eb445ce6a2b338,
         [
             DirEntry(
                 PathBuf {
@@ -221,7 +244,7 @@ mod test {
         ],
     ),
     (
-        059f99d9af988b464474f5a7815c7e22,
+        e7e85cb3f8b264a44bb6f0ca86240306,
         [
             DirEntry(
                 PathBuf {
@@ -231,7 +254,7 @@ mod test {
         ],
     ),
     (
-        55179001e96aceaf7cf5cad3e2ff8873,
+        ec3c26294441f47ed82db23d3f53db01,
         [
             DirEntry(
                 PathBuf {
@@ -253,7 +276,8 @@ mod test {
     #[test]
     fn test_count_files() {
         let path = Path::new("./test_fixtures");
-        let got = task::block_on(count_files(path));
+        let max_depth = -1;
+        let got = task::block_on(count_files(path, max_depth));
         assert_eq!(6u64, got.unwrap());
     }
 }

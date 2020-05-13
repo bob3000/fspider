@@ -15,10 +15,11 @@ fn main() {
     let args = Cli::from_args();
     println!("{:?}", args);
 
-    let num_files = task::block_on(lib::count_files(&args.path)).unwrap();
+    let opts = lib::MD5HashFileOpts{ max_depth: -1, read_buf_size: 512 };
+    let num_files = task::block_on(lib::count_files(&args.path, opts.max_depth)).unwrap();
 
     let progress = ProgressBar::new(num_files);
-    let hf = task::block_on( lib::md5_hash_files(&args.path, move || {progress.inc(1)})).unwrap();
+    let hf = task::block_on( lib::md5_hash_files(&args.path, opts, move || {progress.inc(1)})).unwrap();
     let results: lib::DupVec = hf.duplicates().sort(lib::SortOrder::Size);
 
     for res in results.into_inner().iter() {
