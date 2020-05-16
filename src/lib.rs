@@ -114,12 +114,14 @@ pub async fn crawl_fs(path: impl AsRef<Path>, max_depth: i16) -> Result<Vec<DirE
     Ok(results.0)
 }
 
-pub async fn hash_file_vec<F, T>(mut files: Vec<DirEntry>, batch_size: u16, hash_fn: &dyn Fn(DirEntry) -> F,
+pub async fn hash_file_vec<C, F, T>(mut files: Vec<DirEntry>, batch_size: u16, hash_fn: &dyn Fn(DirEntry) -> F, mut loop_cb: C,
 ) -> Result<HashFNameMap<T>, Box<dyn Error + Send>>
 where
+    C: FnMut() + Send + Sync + 'static,
     T: Hash + Eq + Send + Sync,
     F: Future<Output = FileHash<T>>,
 {
+    let num_files =  files.len();
     let mut files_processed: usize = 0;
     let mut hash_fname_map: HashFNameMap<T> = HashFNameMap::new();
     let mut join_handle: Vec<F> = Vec::new();
@@ -138,6 +140,7 @@ where
 
     while let Some(f) = files.pop() {
         files_processed += 1;
+        loop_cb();
         join_handle.push(hash_fn(f));
         if files_processed % batch_size as usize == 0 {
             join_all(join_handle, &mut hash_fname_map).await;
@@ -145,13 +148,18 @@ where
         }
     }
     join_all(join_handle, &mut hash_fname_map).await;
-
+    for _ in 0..=num_files-files_processed {
+        loop_cb();
+    }
 
     Ok(hash_fname_map)
 }
 
-pub async fn md5_hash_file_vec(files: Vec<DirEntry>, opts: MD5HashFileOpts
-) -> Result<HashFNameMap<md5::Digest>, Box<dyn Error + Send>> {
+pub async fn md5_hash_file_vec<C>(files: Vec<DirEntry>, opts: MD5HashFileOpts, loop_cb: C,
+) -> Result<HashFNameMap<md5::Digest>, Box<dyn Error + Send>>
+where
+    C: FnMut() + Send + Sync + 'static,
+{
 
     let hash_fn = |e: DirEntry| async move {
         let f_handle = File::open(e.path()).await.unwrap();
@@ -185,12 +193,13 @@ pub async fn md5_hash_file_vec(files: Vec<DirEntry>, opts: MD5HashFileOpts
         FileHash(Some(fdigest), Some(e))
     };
 
-    let mut hash_fname_map = hash_file_vec(files, opts.batch_size, &hash_fn).await.unwrap();
+    let mut hash_fname_map = hash_file_vec(files, opts.batch_size, &hash_fn, loop_cb).await.unwrap();
     for v in hash_fname_map.inner.values_mut() {
         v.sort_by(|a, b| {
             a.path().partial_cmp(&b.path()).unwrap()
         });
     }
+
     Ok(hash_fname_map)
 }
 
@@ -277,7 +286,7 @@ mod test {
         let path = Path::new("./test_fixtures");
         let opts = MD5HashFileOpts{ max_depth: -1, read_buf_size: 256, sample_rate: 10, sample_threshold: 1024, batch_size: 2 };
         let files = task::block_on(crawl_fs(path, opts.max_depth)).unwrap();
-        let got = task::block_on(md5_hash_file_vec(files, opts)).unwrap().duplicates().sort(SortOrder::Size);
+        let got = task::block_on(md5_hash_file_vec(files, opts, || {})).unwrap().duplicates().sort(SortOrder::Size);
         let want = r#"DupVec {
     inner: [
         [
@@ -380,7 +389,7 @@ mod test {
         let max_depth = -1;
         let files = task::block_on(crawl_fs(path, max_depth)).unwrap();
         let opts = MD5HashFileOpts{ max_depth: -1, read_buf_size: 256, sample_rate: 10, sample_threshold: 1024, batch_size: 2 };
-        let got = task::block_on(md5_hash_file_vec(files, opts)).unwrap();
+        let got = task::block_on(md5_hash_file_vec(files, opts, || {})).unwrap();
         let mut tuples: Vec<(md5::Digest, Vec<DirEntry>)> = got.inner.into_iter().collect();
         tuples.sort_by(|a, b| format!("{:?}", a.1[0]).cmp(&format!("{:?}", b.1[0])));
         let want = r#"[
