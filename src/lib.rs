@@ -3,7 +3,7 @@ use async_std::fs::{self, DirEntry, File};
 use async_std::path::{Path};
 use async_std::prelude::*;
 use async_std::task;
-use async_std::io::BufReader;
+use async_std::io::{BufReader, SeekFrom};
 use futures::future::Future;
 use std::cmp::Eq;
 use std::collections::HashMap;
@@ -118,6 +118,8 @@ pub async fn count_files(path: impl AsRef<Path>, max_depth: i16) -> Result<u64, 
 pub struct MD5HashFileOpts {
     pub max_depth: i16,
     pub read_buf_size: usize,
+    pub sample_rate: u64,
+    pub sample_threshold: u64,
 }
 
 pub async fn md5_hash_files<C>(path: impl AsRef<Path>, opts: MD5HashFileOpts, mut loop_cb: C
@@ -146,15 +148,28 @@ where
 
     let hash_file_fn = &|e: DirEntry| async move {
         let f_handle = File::open(e.path()).await.unwrap();
+        let f_size = f_handle.metadata().await.unwrap().len();
         let mut read_buf = vec![0; opts.read_buf_size];
         let mut buf_reader = BufReader::with_capacity(opts.read_buf_size, f_handle);
         let mut fdigest = md5::compute("");
-        while 0 <  buf_reader.read(&mut read_buf[..]).await.unwrap() {
-            let mut to_hash: Vec<u8> = Vec::with_capacity(read_buf.len() + fdigest.0.len());
-            to_hash.append(&mut fdigest.0.to_vec());
-            to_hash.append(&mut read_buf);
-            fdigest = md5::compute(to_hash);
+        let do_sample = f_size > opts.sample_threshold;
+        let mut skip_bytes = 0;
+        let sample_rate = if opts.sample_rate < 1u64 { 1i64 } else { opts.sample_rate as i64 };
+        if do_sample {
+            skip_bytes = (f_size as i64 / sample_rate) as i64;
         }
+        fn hash_it(mut read_buf: &mut Vec<u8>, last_digest: md5::Digest) -> md5::Digest {
+            let mut to_hash: Vec<u8> = Vec::with_capacity(read_buf.len() + last_digest.0.len());
+            to_hash.append(&mut last_digest.0.to_vec());
+            to_hash.append(&mut read_buf);
+            md5::compute(to_hash)
+        }
+        while 0 <  buf_reader.read(&mut read_buf[..]).await.unwrap() {
+            fdigest = hash_it(&mut read_buf, fdigest);
+            buf_reader.seek(SeekFrom::Current(skip_bytes)).await.unwrap();
+        }
+        buf_reader.read_to_end(&mut read_buf).await.unwrap();
+        fdigest = hash_it(&mut read_buf, fdigest);
 
         FileHash(Some(fdigest), Some(e))
     };
@@ -175,7 +190,7 @@ mod test {
     #[test]
     fn test_dup_vec() {
         let path = Path::new("./test_fixtures");
-        let opts = MD5HashFileOpts{ max_depth: -1, read_buf_size: 256 };
+        let opts = MD5HashFileOpts{ max_depth: -1, read_buf_size: 256, sample_rate: 10, sample_threshold: 1024, };
         let got = task::block_on(md5_hash_files(path, opts, || {})).unwrap().duplicates().sort(SortOrder::Size);
         let want = r#"DupVec {
     inner: [
@@ -213,13 +228,13 @@ mod test {
     #[test]
     fn test_md5_file_map() {
         let path = Path::new("./test_fixtures");
-        let opts = MD5HashFileOpts{ max_depth: -1, read_buf_size: 256 };
+        let opts = MD5HashFileOpts{ max_depth: -1, read_buf_size: 256, sample_rate: 10, sample_threshold: 1024, };
         let got = task::block_on(md5_hash_files(path, opts, || {})).unwrap();
         let mut tuples: Vec<(md5::Digest, Vec<DirEntry>)> = got.inner.into_iter().collect();
         tuples.sort_by(|a, b| format!("{:?}", a.1[0]).cmp(&format!("{:?}", b.1[0])));
         let want = r#"[
     (
-        d475703402a752e7cf1c94562b0998ee,
+        b743cd81f58d58406a0874356eb3d03f,
         [
             DirEntry(
                 PathBuf {
@@ -229,7 +244,7 @@ mod test {
         ],
     ),
     (
-        036fb9ab9b5c7b72c7eb445ce6a2b338,
+        ff227372abc3f8c57a807e5064d79b59,
         [
             DirEntry(
                 PathBuf {
@@ -244,7 +259,7 @@ mod test {
         ],
     ),
     (
-        e7e85cb3f8b264a44bb6f0ca86240306,
+        9942b78186753bd8f9c0e8185df35cd4,
         [
             DirEntry(
                 PathBuf {
@@ -254,7 +269,7 @@ mod test {
         ],
     ),
     (
-        ec3c26294441f47ed82db23d3f53db01,
+        5070a59f0f65446b614921f0655125cf,
         [
             DirEntry(
                 PathBuf {
