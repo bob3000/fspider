@@ -1,5 +1,5 @@
 use async_recursion::async_recursion;
-use async_std::fs::{self, DirEntry, File};
+use async_std::fs::{self, File};
 use async_std::path::{Path, PathBuf};
 use async_std::prelude::*;
 use async_std::task;
@@ -10,7 +10,6 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::hash::Hash;
 use std::sync::mpsc::{self, Sender, Receiver};
-use futures::join;
 
 pub type HashFNameMapInner<T> = HashMap<T, Vec<PathBuf>>;
 pub type DupVecInner = Vec<Vec<PathBuf>>;
@@ -19,7 +18,7 @@ pub type DupVecInner = Vec<Vec<PathBuf>>;
 pub struct FileHash<T: Hash + Eq + Send + Sync>(Option<T>, Option<PathBuf>);
 
 pub enum SortOrder {
-    Alphanumeric,
+    Lexicographic,
     Size,
 }
 
@@ -37,7 +36,7 @@ impl DupVec {
                                     let meta_b = task::block_on(b[0].metadata()).unwrap();
                                     meta_a.len().cmp(&meta_b.len())
             }),
-            SortOrder::Alphanumeric => self.inner.sort_by(|a, b| {
+            SortOrder::Lexicographic => self.inner.sort_by(|a, b| {
                 a[0].cmp(&b[0])}),
         }
         self
@@ -155,6 +154,15 @@ where
     Ok(hash_fname_map)
 }
 
+#[derive(Copy, Clone, Debug)]
+pub struct MD5HashFileOpts {
+    pub max_depth: i16,
+    pub read_buf_size: usize,
+    pub sample_rate: u64,
+    pub sample_threshold: u64,
+    pub batch_size: u16,
+}
+
 pub async fn md5_hash_file_vec<C>(files: Vec<PathBuf>, opts: MD5HashFileOpts, loop_cb: C,
 ) -> Result<HashFNameMap<md5::Digest>, Box<dyn Error + Send>>
 where
@@ -203,83 +211,8 @@ where
     Ok(hash_fname_map)
 }
 
-#[derive(Copy, Clone, Debug)]
-pub struct MD5HashFileOpts {
-    pub max_depth: i16,
-    pub read_buf_size: usize,
-    pub sample_rate: u64,
-    pub sample_threshold: u64,
-    pub batch_size: u16,
-}
-
-pub async fn md5_hash_files<C>(path: impl AsRef<Path>, opts: MD5HashFileOpts, mut loop_cb: C
-) -> Result<HashFNameMap<md5::Digest>, Box<dyn Error + Send>>
-where
-    C: FnMut() + Send + Sync + 'static
-{
-    let (sender, receiver): (Sender<FileHash<md5::Digest>>, Receiver<FileHash<md5::Digest>>)  = mpsc::channel();
-    let mut hash_fname_map: HashFNameMap<md5::Digest> = HashFNameMap::new();
-
-    let reader_handle = task::spawn(async move {
-        while let Ok(ref mut file_hash) = receiver.recv() {
-            let key = file_hash.0.take().unwrap();
-            let val = file_hash.1.take().unwrap();
-            let entry = hash_fname_map.inner.entry(key).or_insert(Vec::new());
-            entry.push(val);
-            loop_cb();
-        }
-        for v in hash_fname_map.inner.values_mut() {
-            v.sort_by(|a, b| {
-                a.partial_cmp(b).unwrap()
-            });
-        }
-        hash_fname_map
-    });
-
-    let hash_file_fn = &|e: PathBuf| async move {
-        let f_handle = File::open(&e).await.unwrap();
-        let f_size = f_handle.metadata().await.unwrap().len();
-        let mut read_buf = vec![0; opts.read_buf_size];
-        let mut buf_reader = BufReader::with_capacity(opts.read_buf_size, f_handle);
-        let mut fdigest = md5::compute("");
-        let do_sample = f_size > opts.sample_threshold;
-        let mut skip_bytes = 0;
-        let sample_rate = if opts.sample_rate < 1u64 { 1i64 } else { opts.sample_rate as i64 };
-        if do_sample {
-            skip_bytes = (f_size as i64 / sample_rate) as i64;
-        }
-
-        fn hash_it(mut read_buf: &mut Vec<u8>, last_digest: md5::Digest) -> md5::Digest {
-            let mut to_hash: Vec<u8> = Vec::with_capacity(read_buf.len() + last_digest.0.len());
-            to_hash.append(&mut last_digest.0.to_vec());
-            to_hash.append(&mut read_buf);
-            md5::compute(to_hash)
-        }
-
-        while 0 <  buf_reader.read(&mut read_buf[..]).await.unwrap() {
-            fdigest = hash_it(&mut read_buf, fdigest);
-            buf_reader.seek(SeekFrom::Current(skip_bytes)).await.unwrap();
-        }
-
-        // if the buffer can't be filled close to the EOF we still have to get the remaining data
-        buf_reader.read_to_end(&mut read_buf).await.unwrap();
-        fdigest = hash_it(&mut read_buf, fdigest);
-
-        FileHash(Some(fdigest), Some(e))
-    };
-
-    let writer_handle = recursive_file_map(sender, &path, opts.max_depth, hash_file_fn);
-
-    let retval = futures::join!(
-        reader_handle,
-        writer_handle
-    );
-    Ok(retval.0)
-}
-
 mod test {
     use super::*;
-    use md5;
 
     #[test]
     fn test_dup_vec() {
@@ -310,57 +243,6 @@ mod test {
 
         // println!("{:#?}", got);
         assert_eq!(format!("{:#?}", got), want);
-    }
-
-    #[test]
-    fn test_md5_file_map() {
-        let path = Path::new("./test_fixtures");
-        let opts = MD5HashFileOpts{ max_depth: -1, read_buf_size: 256, sample_rate: 10, sample_threshold: 1024, batch_size: 2 };
-        let got = task::block_on(md5_hash_files(path, opts, || {})).unwrap();
-        let mut tuples: Vec<(md5::Digest, Vec<PathBuf>)> = got.inner.into_iter().collect();
-        tuples.sort_by(|a, b| format!("{:?}", a.1[0]).cmp(&format!("{:?}", b.1[0])));
-        let want = r#"[
-    (
-        b743cd81f58d58406a0874356eb3d03f,
-        [
-            PathBuf {
-                inner: "./test_fixtures/alpha/a",
-            },
-        ],
-    ),
-    (
-        ff227372abc3f8c57a807e5064d79b59,
-        [
-            PathBuf {
-                inner: "./test_fixtures/alpha/b",
-            },
-            PathBuf {
-                inner: "./test_fixtures/alpha/bravo/charlie/b",
-            },
-        ],
-    ),
-    (
-        9942b78186753bd8f9c0e8185df35cd4,
-        [
-            PathBuf {
-                inner: "./test_fixtures/alpha/bravo/charlie/c",
-            },
-        ],
-    ),
-    (
-        5070a59f0f65446b614921f0655125cf,
-        [
-            PathBuf {
-                inner: "./test_fixtures/alpha/bravo/charlie/d",
-            },
-            PathBuf {
-                inner: "./test_fixtures/alpha/bravo/d",
-            },
-        ],
-    ),
-]"#;
-        assert_eq!(format!("{:#?}", tuples), want);
-        // println!("{:#?}", tuples);
     }
 
     #[test]
