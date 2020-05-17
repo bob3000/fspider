@@ -1,6 +1,6 @@
 use async_recursion::async_recursion;
 use async_std::fs::{self, DirEntry, File};
-use async_std::path::Path;
+use async_std::path::{Path, PathBuf};
 use async_std::prelude::*;
 use async_std::task;
 use async_std::io::{BufReader, SeekFrom};
@@ -12,11 +12,11 @@ use std::hash::Hash;
 use std::sync::mpsc::{self, Sender, Receiver};
 use futures::join;
 
-pub type HashFNameMapInner<T> = HashMap<T, Vec<DirEntry>>;
-pub type DupVecInner = Vec<Vec<DirEntry>>;
+pub type HashFNameMapInner<T> = HashMap<T, Vec<PathBuf>>;
+pub type DupVecInner = Vec<Vec<PathBuf>>;
 
 #[derive(Debug)]
-pub struct FileHash<T: Hash + Eq + Send + Sync>(Option<T>, Option<DirEntry>);
+pub struct FileHash<T: Hash + Eq + Send + Sync>(Option<T>, Option<PathBuf>);
 
 pub enum SortOrder {
     Alphanumeric,
@@ -25,7 +25,7 @@ pub enum SortOrder {
 
 #[derive(Debug)]
 pub struct DupVec {
-    inner: Vec<Vec<DirEntry>>,
+    inner: Vec<Vec<PathBuf>>,
 }
 
 impl DupVec {
@@ -38,7 +38,7 @@ impl DupVec {
                                     meta_a.len().cmp(&meta_b.len())
             }),
             SortOrder::Alphanumeric => self.inner.sort_by(|a, b| {
-                a[0].path().cmp(&b[0].path())}),
+                a[0].cmp(&b[0])}),
         }
         self
     }
@@ -69,7 +69,7 @@ pub async fn recursive_file_map<T, F>(
     sender: mpsc::Sender<T>,
     path: impl AsRef<Path> + 'async_recursion,
     mut max_depth: i16,
-    map_fn: &'async_recursion dyn Fn(DirEntry) -> F,
+    map_fn: &'async_recursion dyn Fn(PathBuf) -> F,
 ) -> Result<(), Box<dyn Error + Send>>
 where
     T: Send + Sync,
@@ -85,15 +85,15 @@ where
                 .await
                 .unwrap();
         } else {
-            sender.send(map_fn(entry.unwrap()).await).unwrap();
+            sender.send(map_fn(entry.unwrap().path()).await).unwrap();
         }
     }
     Ok(())
 }
 
-pub async fn crawl_fs(path: impl AsRef<Path>, max_depth: i16) -> Result<Vec<DirEntry>, Box<dyn Error>>
+pub async fn crawl_fs(path: impl AsRef<Path>, max_depth: i16) -> Result<Vec<PathBuf>, Box<dyn Error>>
 {
-    let (sender, receiver): (Sender<DirEntry>, Receiver<DirEntry>)  = mpsc::channel();
+    let (sender, receiver): (Sender<PathBuf>, Receiver<PathBuf>)  = mpsc::channel();
     let mut file_vec = Vec::new();
 
     let reader_handle = task::spawn(async move {
@@ -103,7 +103,7 @@ pub async fn crawl_fs(path: impl AsRef<Path>, max_depth: i16) -> Result<Vec<DirE
         file_vec
     });
 
-    let writer_handle = recursive_file_map(sender, &path, max_depth, &|d: DirEntry| async move {
+    let writer_handle = recursive_file_map(sender, &path, max_depth, &|d: PathBuf| async move {
         d
     });
 
@@ -114,7 +114,7 @@ pub async fn crawl_fs(path: impl AsRef<Path>, max_depth: i16) -> Result<Vec<DirE
     Ok(results.0)
 }
 
-pub async fn hash_file_vec<C, F, T>(mut files: Vec<DirEntry>, batch_size: u16, hash_fn: &dyn Fn(DirEntry) -> F, mut loop_cb: C,
+pub async fn hash_file_vec<C, F, T>(mut files: Vec<PathBuf>, batch_size: u16, hash_fn: &dyn Fn(PathBuf) -> F, mut loop_cb: C,
 ) -> Result<HashFNameMap<T>, Box<dyn Error + Send>>
 where
     C: FnMut() + Send + Sync + 'static,
@@ -155,14 +155,14 @@ where
     Ok(hash_fname_map)
 }
 
-pub async fn md5_hash_file_vec<C>(files: Vec<DirEntry>, opts: MD5HashFileOpts, loop_cb: C,
+pub async fn md5_hash_file_vec<C>(files: Vec<PathBuf>, opts: MD5HashFileOpts, loop_cb: C,
 ) -> Result<HashFNameMap<md5::Digest>, Box<dyn Error + Send>>
 where
     C: FnMut() + Send + Sync + 'static,
 {
 
-    let hash_fn = |e: DirEntry| async move {
-        let f_handle = File::open(e.path()).await.unwrap();
+    let hash_fn = |e: PathBuf| async move {
+        let f_handle = File::open(&e).await.unwrap();
         let f_size = f_handle.metadata().await.unwrap().len();
         let mut read_buf = vec![0; opts.read_buf_size];
         let mut buf_reader = BufReader::with_capacity(opts.read_buf_size, f_handle);
@@ -196,7 +196,7 @@ where
     let mut hash_fname_map = hash_file_vec(files, opts.batch_size, &hash_fn, loop_cb).await.unwrap();
     for v in hash_fname_map.inner.values_mut() {
         v.sort_by(|a, b| {
-            a.path().partial_cmp(&b.path()).unwrap()
+            a.partial_cmp(b).unwrap()
         });
     }
 
@@ -230,14 +230,14 @@ where
         }
         for v in hash_fname_map.inner.values_mut() {
             v.sort_by(|a, b| {
-                a.path().partial_cmp(&b.path()).unwrap()
+                a.partial_cmp(b).unwrap()
             });
         }
         hash_fname_map
     });
 
-    let hash_file_fn = &|e: DirEntry| async move {
-        let f_handle = File::open(e.path()).await.unwrap();
+    let hash_file_fn = &|e: PathBuf| async move {
+        let f_handle = File::open(&e).await.unwrap();
         let f_size = f_handle.metadata().await.unwrap().len();
         let mut read_buf = vec![0; opts.read_buf_size];
         let mut buf_reader = BufReader::with_capacity(opts.read_buf_size, f_handle);
@@ -290,28 +290,20 @@ mod test {
         let want = r#"DupVec {
     inner: [
         [
-            DirEntry(
-                PathBuf {
-                    inner: "./test_fixtures/alpha/b",
-                },
-            ),
-            DirEntry(
-                PathBuf {
-                    inner: "./test_fixtures/alpha/bravo/charlie/b",
-                },
-            ),
+            PathBuf {
+                inner: "./test_fixtures/alpha/b",
+            },
+            PathBuf {
+                inner: "./test_fixtures/alpha/bravo/charlie/b",
+            },
         ],
         [
-            DirEntry(
-                PathBuf {
-                    inner: "./test_fixtures/alpha/bravo/charlie/d",
-                },
-            ),
-            DirEntry(
-                PathBuf {
-                    inner: "./test_fixtures/alpha/bravo/d",
-                },
-            ),
+            PathBuf {
+                inner: "./test_fixtures/alpha/bravo/charlie/d",
+            },
+            PathBuf {
+                inner: "./test_fixtures/alpha/bravo/d",
+            },
         ],
     ],
 }"#;
@@ -325,57 +317,45 @@ mod test {
         let path = Path::new("./test_fixtures");
         let opts = MD5HashFileOpts{ max_depth: -1, read_buf_size: 256, sample_rate: 10, sample_threshold: 1024, batch_size: 2 };
         let got = task::block_on(md5_hash_files(path, opts, || {})).unwrap();
-        let mut tuples: Vec<(md5::Digest, Vec<DirEntry>)> = got.inner.into_iter().collect();
+        let mut tuples: Vec<(md5::Digest, Vec<PathBuf>)> = got.inner.into_iter().collect();
         tuples.sort_by(|a, b| format!("{:?}", a.1[0]).cmp(&format!("{:?}", b.1[0])));
         let want = r#"[
     (
         b743cd81f58d58406a0874356eb3d03f,
         [
-            DirEntry(
-                PathBuf {
-                    inner: "./test_fixtures/alpha/a",
-                },
-            ),
+            PathBuf {
+                inner: "./test_fixtures/alpha/a",
+            },
         ],
     ),
     (
         ff227372abc3f8c57a807e5064d79b59,
         [
-            DirEntry(
-                PathBuf {
-                    inner: "./test_fixtures/alpha/b",
-                },
-            ),
-            DirEntry(
-                PathBuf {
-                    inner: "./test_fixtures/alpha/bravo/charlie/b",
-                },
-            ),
+            PathBuf {
+                inner: "./test_fixtures/alpha/b",
+            },
+            PathBuf {
+                inner: "./test_fixtures/alpha/bravo/charlie/b",
+            },
         ],
     ),
     (
         9942b78186753bd8f9c0e8185df35cd4,
         [
-            DirEntry(
-                PathBuf {
-                    inner: "./test_fixtures/alpha/bravo/charlie/c",
-                },
-            ),
+            PathBuf {
+                inner: "./test_fixtures/alpha/bravo/charlie/c",
+            },
         ],
     ),
     (
         5070a59f0f65446b614921f0655125cf,
         [
-            DirEntry(
-                PathBuf {
-                    inner: "./test_fixtures/alpha/bravo/charlie/d",
-                },
-            ),
-            DirEntry(
-                PathBuf {
-                    inner: "./test_fixtures/alpha/bravo/d",
-                },
-            ),
+            PathBuf {
+                inner: "./test_fixtures/alpha/bravo/charlie/d",
+            },
+            PathBuf {
+                inner: "./test_fixtures/alpha/bravo/d",
+            },
         ],
     ),
 ]"#;
@@ -390,57 +370,45 @@ mod test {
         let files = task::block_on(crawl_fs(path, max_depth)).unwrap();
         let opts = MD5HashFileOpts{ max_depth: -1, read_buf_size: 256, sample_rate: 10, sample_threshold: 1024, batch_size: 2 };
         let got = task::block_on(md5_hash_file_vec(files, opts, || {})).unwrap();
-        let mut tuples: Vec<(md5::Digest, Vec<DirEntry>)> = got.inner.into_iter().collect();
+        let mut tuples: Vec<(md5::Digest, Vec<PathBuf>)> = got.inner.into_iter().collect();
         tuples.sort_by(|a, b| format!("{:?}", a.1[0]).cmp(&format!("{:?}", b.1[0])));
         let want = r#"[
     (
         b743cd81f58d58406a0874356eb3d03f,
         [
-            DirEntry(
-                PathBuf {
-                    inner: "./test_fixtures/alpha/a",
-                },
-            ),
+            PathBuf {
+                inner: "./test_fixtures/alpha/a",
+            },
         ],
     ),
     (
         ff227372abc3f8c57a807e5064d79b59,
         [
-            DirEntry(
-                PathBuf {
-                    inner: "./test_fixtures/alpha/b",
-                },
-            ),
-            DirEntry(
-                PathBuf {
-                    inner: "./test_fixtures/alpha/bravo/charlie/b",
-                },
-            ),
+            PathBuf {
+                inner: "./test_fixtures/alpha/b",
+            },
+            PathBuf {
+                inner: "./test_fixtures/alpha/bravo/charlie/b",
+            },
         ],
     ),
     (
         9942b78186753bd8f9c0e8185df35cd4,
         [
-            DirEntry(
-                PathBuf {
-                    inner: "./test_fixtures/alpha/bravo/charlie/c",
-                },
-            ),
+            PathBuf {
+                inner: "./test_fixtures/alpha/bravo/charlie/c",
+            },
         ],
     ),
     (
         5070a59f0f65446b614921f0655125cf,
         [
-            DirEntry(
-                PathBuf {
-                    inner: "./test_fixtures/alpha/bravo/charlie/d",
-                },
-            ),
-            DirEntry(
-                PathBuf {
-                    inner: "./test_fixtures/alpha/bravo/d",
-                },
-            ),
+            PathBuf {
+                inner: "./test_fixtures/alpha/bravo/charlie/d",
+            },
+            PathBuf {
+                inner: "./test_fixtures/alpha/bravo/d",
+            },
         ],
     ),
 ]"#;
@@ -454,36 +422,24 @@ mod test {
         let max_depth = -1;
         let got = task::block_on(crawl_fs(path, max_depth)).unwrap();
         let want = r#"[
-    DirEntry(
-        PathBuf {
-            inner: "./test_fixtures/alpha/a",
-        },
-    ),
-    DirEntry(
-        PathBuf {
-            inner: "./test_fixtures/alpha/b",
-        },
-    ),
-    DirEntry(
-        PathBuf {
-            inner: "./test_fixtures/alpha/bravo/charlie/c",
-        },
-    ),
-    DirEntry(
-        PathBuf {
-            inner: "./test_fixtures/alpha/bravo/charlie/d",
-        },
-    ),
-    DirEntry(
-        PathBuf {
-            inner: "./test_fixtures/alpha/bravo/charlie/b",
-        },
-    ),
-    DirEntry(
-        PathBuf {
-            inner: "./test_fixtures/alpha/bravo/d",
-        },
-    ),
+    PathBuf {
+        inner: "./test_fixtures/alpha/a",
+    },
+    PathBuf {
+        inner: "./test_fixtures/alpha/b",
+    },
+    PathBuf {
+        inner: "./test_fixtures/alpha/bravo/charlie/c",
+    },
+    PathBuf {
+        inner: "./test_fixtures/alpha/bravo/charlie/d",
+    },
+    PathBuf {
+        inner: "./test_fixtures/alpha/bravo/charlie/b",
+    },
+    PathBuf {
+        inner: "./test_fixtures/alpha/bravo/d",
+    },
 ]"#;
         assert_eq!(want, format!("{:#?}", got));
         // println!("{:#?}", got)

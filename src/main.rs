@@ -31,7 +31,7 @@ fn main() {
 
     for res in results.into_inner().iter() {
         for duplicate in res.iter() {
-            println!("{}", duplicate.path().to_str().unwrap());
+            println!("{}", duplicate.to_str().unwrap());
         }
         println!();
     }
