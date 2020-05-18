@@ -74,12 +74,13 @@ where
     T: Send + Sync,
     F: Future<Output = T>,
 {
+    max_depth -= 1;
     let mut entries = fs::read_dir(path).await.unwrap();
     while let Some(entry) = entries.next().await {
-        if max_depth == 0 { break; } else { max_depth -= 1 };
         let next_path = entry.as_ref().unwrap().path();
 
         if next_path.is_dir().await {
+            if max_depth == 0 { return Ok(()) };
             recursive_file_map(sender.clone(), next_path.as_path(), max_depth, &map_fn)
                 .await
                 .unwrap();

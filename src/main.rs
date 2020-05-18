@@ -8,18 +8,18 @@ use indicatif::ProgressBar;
 struct Cli {
     #[structopt(parse(from_os_str))]
     path: PathBuf,
+    #[structopt(short = "d", long = "max-depth", default_value = "-1")]
+    max_depth: i16,
 }
 
 
 fn main() {
     let args = Cli::from_args();
-    println!("{:?}", args);
-
     let opts = lib::MD5HashFileOpts{
-        max_depth: -1,
+        max_depth: args.max_depth,
         read_buf_size: 512,
         sample_rate: 10,
-        sample_threshold: 1024,
+        sample_threshold: 1024 * 1024,
         batch_size: 128,
     };
     let files_to_hash = task::block_on(lib::crawl_fs(&args.path, opts.max_depth)).unwrap();
