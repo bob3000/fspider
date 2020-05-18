@@ -131,9 +131,15 @@ where
     {
         let results = future::join_all(handles.into_iter()).await;
         for res in results.into_iter() {
-            let r = res?;
-            let entry = hfm.inner.entry(r.0.unwrap()).or_insert(Vec::new());
-            entry.push(r.1.unwrap());
+            match res {
+                Ok(file_hash) => {
+                    let entry = hfm.inner.entry(file_hash.0.unwrap()).or_insert(Vec::new());
+                    entry.push(file_hash.1.unwrap());
+                },
+                Err(e) => {
+                    eprintln!("{:?}", e);
+                },
+            };
         }
         Ok(())
     }
