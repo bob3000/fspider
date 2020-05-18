@@ -3,7 +3,7 @@ use async_std::task;
 use structopt::StructOpt;
 use std::path::PathBuf;
 use indicatif::{ProgressBar, ProgressStyle};
-use console::Term;
+use console::style;
 use exitfailure::ExitFailure;
 
 #[derive(StructOpt, Debug)]
@@ -27,16 +27,13 @@ fn main() -> Result<(), ExitFailure> {
         batch_size: 128,
     };
 
-    let term_err = Term::stderr();
-    let term_out = Term::stdout();
-
-    term_err.write_line("Reading file tree ...")?;
+    eprintln!("{}", style("Reading file tree ...").green());
     let progress_crawling = ProgressBar::new_spinner();
     let files_to_hash = task::block_on(
         lib::crawl_fs(&args.path, opts.max_depth, opts.follow_symlinks, &mut move || {progress_crawling.inc(1)})).unwrap();
     let num_files = files_to_hash.len();
 
-    term_err.write_line("Generating check sums ...")?;
+    eprintln!("{}", style("Generating check sums ...").green());
     let progress_hashing = ProgressBar::new(num_files as u64);
     progress_hashing.set_style(ProgressStyle::default_bar()
         .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} {msg}")
@@ -45,19 +42,21 @@ fn main() -> Result<(), ExitFailure> {
     let results: lib::DupVec = hf.duplicates().sort(lib::SortOrder::Size);
 
     if !errors.is_empty() {
-        term_err.write_line("Encountered errors ...")?;
+        eprintln!("{}", style("Encountered errors ...").red());
         for err in errors.iter() {
-            term_err.write_line(&format!("{}\n", err.to_string()))?;
+            println!("{}", err.to_string());
         }
-        term_out.write_line("")?;
+        println!()
     }
 
-    term_err.write_line("Found duplicates ...")?;
-    for res in results.into_inner().iter() {
-        for duplicate in res.iter() {
-            term_out.write_line(&format!("{}", duplicate.to_str().unwrap()))?;
+    if !results.inner().is_empty() {
+        eprintln!("{}", style("Found duplicates sums ...").green());
+        for res in results.into_inner().iter() {
+            for duplicate in res.iter() {
+                println!("{}", duplicate.to_str().unwrap());
+            }
+            println!();
         }
-        term_out.write_line("")?;
     }
     Ok(())
 }

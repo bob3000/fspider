@@ -44,6 +44,10 @@ impl DupVec {
     pub fn into_inner(self) -> DupVecInner {
         self.inner
     }
+
+    pub fn inner(&self) -> &DupVecInner {
+        &self.inner
+    }
 }
 
 #[derive(Debug)]
