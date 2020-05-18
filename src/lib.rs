@@ -63,14 +63,16 @@ impl<T: Hash + Eq> HashFNameMap<T> {
 }
 
 #[async_recursion(?Send)]
-pub async fn recursive_file_map<T, F>(
+pub async fn recursive_file_map<C, T, F>(
     sender: mpsc::Sender<T>,
     path: impl AsRef<Path> + 'async_recursion,
     mut max_depth: i16,
     follow_symlinks: bool,
     map_fn: &'async_recursion dyn Fn(PathBuf) -> F,
+    send_cb: &mut C,
 ) -> Result<(), std::io::Error>
 where
+    C: FnMut() + Send + Sync + 'static,
     T: Send + Sync,
     F: Future<Output = T>,
 {
@@ -82,19 +84,22 @@ where
         let f_sym_meta = next_path.symlink_metadata().await?;
         let f_type = f_sym_meta.file_type();
         if f_type.is_symlink() && !follow_symlinks {
-            // return Err(std::io::Error::new(ErrorKind::Other, "follow symlinks disabled"));
             continue;
         } else if next_path.is_dir().await {
             if max_depth == 0 { return Ok(()) };
-            recursive_file_map(sender.clone(), next_path.as_path(), max_depth, follow_symlinks, &map_fn).await?;
+            recursive_file_map(sender.clone(), next_path.as_path(), max_depth, follow_symlinks, &map_fn, send_cb).await?;
         } else {
+            send_cb();
             sender.send(map_fn(entry.unwrap().path()).await).unwrap();
         }
     }
     Ok(())
 }
 
-pub async fn crawl_fs(path: impl AsRef<Path>, max_depth: i16, follow_symlinks: bool) -> Result<Vec<PathBuf>, std::io::Error>
+pub async fn crawl_fs<C>(path: impl AsRef<Path>, max_depth: i16, follow_symlinks: bool, send_cb: &mut C,
+) -> Result<Vec<PathBuf>, std::io::Error>
+where
+    C: FnMut() + Send + Sync + 'static,
 {
     let (sender, receiver): (Sender<PathBuf>, Receiver<PathBuf>)  = mpsc::channel();
     let mut file_vec = Vec::new();
@@ -108,7 +113,7 @@ pub async fn crawl_fs(path: impl AsRef<Path>, max_depth: i16, follow_symlinks: b
 
     let writer_handle = recursive_file_map(sender, &path, max_depth, follow_symlinks, &|d: PathBuf| async move {
         d
-    });
+    }, send_cb);
 
     let results = futures::join!(
         reader_handle,
@@ -240,7 +245,7 @@ mod test {
             sample_threshold: 1024,
             batch_size: 2
         };
-        let files = task::block_on(crawl_fs(path, opts.max_depth, false)).unwrap();
+        let files = task::block_on(crawl_fs(path, opts.max_depth, false, &mut || {})).unwrap();
         let got = task::block_on(md5_hash_file_vec(files, opts, || {})).unwrap().duplicates().sort(SortOrder::Size);
         let want = r#"DupVec {
     inner: [
@@ -271,7 +276,7 @@ mod test {
     fn test_md5_hash_file_vec() {
         let path = Path::new("./test_fixtures");
         let max_depth = -1;
-        let files = task::block_on(crawl_fs(path, max_depth, false)).unwrap();
+        let files = task::block_on(crawl_fs(path, max_depth, false, &mut || {})).unwrap();
         let opts = MD5HashFileOpts{
             max_depth: -1,
             follow_symlinks: false,
@@ -331,7 +336,7 @@ mod test {
     fn test_crawl_fs() {
         let path = Path::new("./test_fixtures");
         let max_depth = -1;
-        let got = task::block_on(crawl_fs(path, max_depth, false)).unwrap();
+        let got = task::block_on(crawl_fs(path, max_depth, false, &mut || {})).unwrap();
         let want = r#"[
     PathBuf {
         inner: "./test_fixtures/alpha/a",
@@ -360,7 +365,7 @@ mod test {
     fn test_crawl_fs_symlinks() {
         let path = Path::new("./test_fixtures");
         let max_depth = -1;
-        let got = task::block_on(crawl_fs(path, max_depth, true)).unwrap();
+        let got = task::block_on(crawl_fs(path, max_depth, true, &mut || {})).unwrap();
         let want = r#"[
     PathBuf {
         inner: "./test_fixtures/alpha/a",

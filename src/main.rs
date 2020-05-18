@@ -14,7 +14,6 @@ struct Cli {
     follow_symlinks: bool,
 }
 
-
 fn main() {
     let args = Cli::from_args();
     println!("{:?}", args);
@@ -26,13 +25,19 @@ fn main() {
         sample_threshold: 1024 * 1024,
         batch_size: 128,
     };
-    let files_to_hash = task::block_on(lib::crawl_fs(&args.path, opts.max_depth, opts.follow_symlinks)).unwrap();
+
+    eprintln!("Reading file tree ...");
+    let progress_crawling = ProgressBar::new_spinner();
+    let files_to_hash = task::block_on(
+        lib::crawl_fs(&args.path, opts.max_depth, opts.follow_symlinks, &mut move || {progress_crawling.inc(1)})).unwrap();
     let num_files = files_to_hash.len();
 
+    eprintln!("Generating check sums ...");
     let progress_hashing = ProgressBar::new(num_files as u64);
     let hf = task::block_on( lib::md5_hash_file_vec(files_to_hash, opts, move || {progress_hashing.inc(1)})).unwrap();
     let results: lib::DupVec = hf.duplicates().sort(lib::SortOrder::Size);
 
+    eprintln!("Found duplicates ...");
     for res in results.into_inner().iter() {
         for duplicate in res.iter() {
             println!("{}", duplicate.to_str().unwrap());
