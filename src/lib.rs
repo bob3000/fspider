@@ -7,7 +7,6 @@ use async_std::io::{BufReader, SeekFrom};
 use futures::future::{self, Future};
 use std::cmp::Eq;
 use std::collections::HashMap;
-use std::error::Error;
 use std::hash::Hash;
 use std::sync::mpsc::{self, Sender, Receiver};
 
@@ -69,21 +68,19 @@ pub async fn recursive_file_map<T, F>(
     path: impl AsRef<Path> + 'async_recursion,
     mut max_depth: i16,
     map_fn: &'async_recursion dyn Fn(PathBuf) -> F,
-) -> Result<(), Box<dyn Error + Send>>
+) -> Result<(), std::io::Error>
 where
     T: Send + Sync,
     F: Future<Output = T>,
 {
     max_depth -= 1;
-    let mut entries = fs::read_dir(path).await.unwrap();
+    let mut entries = fs::read_dir(path).await?;
     while let Some(entry) = entries.next().await {
         let next_path = entry.as_ref().unwrap().path();
 
         if next_path.is_dir().await {
             if max_depth == 0 { return Ok(()) };
-            recursive_file_map(sender.clone(), next_path.as_path(), max_depth, &map_fn)
-                .await
-                .unwrap();
+            recursive_file_map(sender.clone(), next_path.as_path(), max_depth, &map_fn).await?;
         } else {
             sender.send(map_fn(entry.unwrap().path()).await).unwrap();
         }
@@ -91,7 +88,7 @@ where
     Ok(())
 }
 
-pub async fn crawl_fs(path: impl AsRef<Path>, max_depth: i16) -> Result<Vec<PathBuf>, Box<dyn Error>>
+pub async fn crawl_fs(path: impl AsRef<Path>, max_depth: i16) -> Result<Vec<PathBuf>, std::io::Error>
 {
     let (sender, receiver): (Sender<PathBuf>, Receiver<PathBuf>)  = mpsc::channel();
     let mut file_vec = Vec::new();
@@ -115,27 +112,30 @@ pub async fn crawl_fs(path: impl AsRef<Path>, max_depth: i16) -> Result<Vec<Path
 }
 
 pub async fn hash_file_vec<C, F, T>(mut files: Vec<PathBuf>, batch_size: u16, hash_fn: &dyn Fn(PathBuf) -> F, mut loop_cb: C,
-) -> Result<HashFNameMap<T>, Box<dyn Error + Send>>
+) -> Result<HashFNameMap<T>, std::io::Error>
 where
     C: FnMut() + Send + Sync + 'static,
     T: Hash + Eq + Send + Sync,
-    F: Future<Output = FileHash<T>>,
+    F: Future<Output = Result<FileHash<T>, std::io::Error>>,
 {
     let num_files =  files.len();
     let mut files_processed: usize = 0;
     let mut hash_fname_map: HashFNameMap<T> = HashFNameMap::new();
     let mut join_handle: Vec<F> = Vec::new();
 
-    async fn join_all<F, T>(handles: Vec<F>, hfm: &mut HashFNameMap<T>)
+    async fn join_all<F, T>(handles: Vec<F>, hfm: &mut HashFNameMap<T>
+    ) -> Result<(), std::io::Error>
     where
         T: Hash + Eq + Send + Sync,
-        F: Future<Output = FileHash<T>>,
+        F: Future<Output = Result<FileHash<T>, std::io::Error>>,
     {
         let results = future::join_all(handles.into_iter()).await;
         for res in results.into_iter() {
-            let entry = hfm.inner.entry(res.0.unwrap()).or_insert(Vec::new());
-            entry.push(res.1.unwrap());
+            let r = res?;
+            let entry = hfm.inner.entry(r.0.unwrap()).or_insert(Vec::new());
+            entry.push(r.1.unwrap());
         }
+        Ok(())
     }
 
     while let Some(f) = files.pop() {
@@ -143,11 +143,11 @@ where
         loop_cb();
         join_handle.push(hash_fn(f));
         if files_processed % batch_size as usize == 0 {
-            join_all(join_handle, &mut hash_fname_map).await;
+            join_all(join_handle, &mut hash_fname_map).await?;
             join_handle = Vec::new();
         }
     }
-    join_all(join_handle, &mut hash_fname_map).await;
+    join_all(join_handle, &mut hash_fname_map).await?;
     for _ in 0..=num_files-files_processed {
         loop_cb();
     }
@@ -165,14 +165,14 @@ pub struct MD5HashFileOpts {
 }
 
 pub async fn md5_hash_file_vec<C>(files: Vec<PathBuf>, opts: MD5HashFileOpts, loop_cb: C,
-) -> Result<HashFNameMap<md5::Digest>, Box<dyn Error + Send>>
+) -> Result<HashFNameMap<md5::Digest>, std::io::Error>
 where
     C: FnMut() + Send + Sync + 'static,
 {
 
     let hash_fn = |e: PathBuf| async move {
-        let f_handle = File::open(&e).await.unwrap();
-        let f_size = f_handle.metadata().await.unwrap().len();
+        let f_handle = File::open(&e).await?;
+        let f_size = f_handle.metadata().await?.len();
         let mut read_buf = vec![0; opts.read_buf_size];
         let mut buf_reader = BufReader::with_capacity(opts.read_buf_size, f_handle);
         let mut fdigest = md5::compute("");
@@ -190,19 +190,19 @@ where
             md5::compute(to_hash)
         }
 
-        while 0 <  buf_reader.read(&mut read_buf[..]).await.unwrap() {
+        while 0 <  buf_reader.read(&mut read_buf[..]).await? {
             fdigest = hash_it(&mut read_buf, fdigest);
-            buf_reader.seek(SeekFrom::Current(skip_bytes)).await.unwrap();
+            buf_reader.seek(SeekFrom::Current(skip_bytes)).await?;
         }
 
         // if the buffer can't be filled close to the EOF we still have to get the remaining data
-        buf_reader.read_to_end(&mut read_buf).await.unwrap();
+        buf_reader.read_to_end(&mut read_buf).await?;
         fdigest = hash_it(&mut read_buf, fdigest);
 
-        FileHash(Some(fdigest), Some(e))
+        Ok(FileHash(Some(fdigest), Some(e)))
     };
 
-    let mut hash_fname_map = hash_file_vec(files, opts.batch_size, &hash_fn, loop_cb).await.unwrap();
+    let mut hash_fname_map = hash_file_vec(files, opts.batch_size, &hash_fn, loop_cb).await?;
     for v in hash_fname_map.inner.values_mut() {
         v.sort_by(|a, b| {
             a.partial_cmp(b).unwrap()
