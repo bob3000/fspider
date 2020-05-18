@@ -3,12 +3,13 @@ use async_std::fs::{self, File};
 use async_std::path::{Path, PathBuf};
 use async_std::prelude::*;
 use async_std::task;
-use async_std::io::{BufReader, SeekFrom};
+use async_std::io::{BufReader, ErrorKind, SeekFrom};
 use futures::future::{self, Future};
 use std::cmp::Eq;
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::sync::mpsc::{self, Sender, Receiver};
+use std::str::FromStr;
 
 pub type HashFNameMapInner<T> = HashMap<T, Vec<PathBuf>>;
 pub type DupVecInner = Vec<Vec<PathBuf>>;
@@ -16,9 +17,22 @@ pub type DupVecInner = Vec<Vec<PathBuf>>;
 #[derive(Debug)]
 pub struct FileHash<T: Hash + Eq + Send + Sync>(Option<T>, Option<PathBuf>);
 
+#[derive(Copy, Clone, Debug)]
 pub enum SortOrder {
     Lexicographic,
     Size,
+}
+
+impl FromStr for SortOrder {
+    type Err = std::io::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "size" => Ok(SortOrder::Size),
+            "lex" => Ok(SortOrder::Lexicographic),
+            _ => Err(std::io::Error::new(ErrorKind::Other, format!("Could not parse {} into `SortOrder`", s)))
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -181,6 +195,7 @@ where
 pub struct MD5HashFileOpts {
     pub max_depth: i16,
     pub follow_symlinks: bool,
+    pub sort_order: SortOrder,
     pub read_buf_size: usize,
     pub sample_rate: u64,
     pub sample_threshold: u64,
@@ -245,6 +260,7 @@ mod test {
         let opts = MD5HashFileOpts{
             max_depth: -1,
             follow_symlinks: false,
+            sort_order: SortOrder::Size,
             read_buf_size: 256,
             sample_rate: 10,
             sample_threshold: 1024,
@@ -285,6 +301,7 @@ mod test {
         let opts = MD5HashFileOpts{
             max_depth: -1,
             follow_symlinks: false,
+            sort_order: SortOrder::Size,
             read_buf_size: 256,
             sample_rate: 10,
             sample_threshold: 1024,

@@ -12,8 +12,10 @@ struct Cli {
     path: PathBuf,
     #[structopt(short = "d", long = "max-depth", default_value = "-1")]
     max_depth: i16,
-    #[structopt(short = "s", long = "follow-links")]
+    #[structopt(short = "l", long = "follow-links")]
     follow_symlinks: bool,
+    #[structopt(short = "s", long = "sort-order", default_value = "size")]
+    sort_order: lib::SortOrder,
 }
 
 fn main() -> Result<(), ExitFailure> {
@@ -21,6 +23,7 @@ fn main() -> Result<(), ExitFailure> {
     let opts = lib::MD5HashFileOpts{
         max_depth: args.max_depth,
         follow_symlinks: args.follow_symlinks,
+        sort_order: args.sort_order,
         read_buf_size: 512,
         sample_rate: 10,
         sample_threshold: 1024 * 1024,
@@ -39,7 +42,7 @@ fn main() -> Result<(), ExitFailure> {
         .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} {msg}")
         .progress_chars("##-"));
     let (hf, errors) = task::block_on( lib::md5_hash_file_vec(files_to_hash, opts, move || {progress_hashing.inc(1)})).unwrap();
-    let results: lib::DupVec = hf.duplicates().sort(lib::SortOrder::Size);
+    let results: lib::DupVec = hf.duplicates().sort(args.sort_order);
 
     if !errors.is_empty() {
         eprintln!("{}", style("Encountered errors ...").red());
