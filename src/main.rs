@@ -10,19 +10,23 @@ struct Cli {
     path: PathBuf,
     #[structopt(short = "d", long = "max-depth", default_value = "-1")]
     max_depth: i16,
+    #[structopt(short = "s", long = "follow-links")]
+    follow_symlinks: bool,
 }
 
 
 fn main() {
     let args = Cli::from_args();
+    println!("{:?}", args);
     let opts = lib::MD5HashFileOpts{
         max_depth: args.max_depth,
+        follow_symlinks: args.follow_symlinks,
         read_buf_size: 512,
         sample_rate: 10,
         sample_threshold: 1024 * 1024,
         batch_size: 128,
     };
-    let files_to_hash = task::block_on(lib::crawl_fs(&args.path, opts.max_depth)).unwrap();
+    let files_to_hash = task::block_on(lib::crawl_fs(&args.path, opts.max_depth, opts.follow_symlinks)).unwrap();
     let num_files = files_to_hash.len();
 
     let progress_hashing = ProgressBar::new(num_files as u64);

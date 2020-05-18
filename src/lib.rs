@@ -67,6 +67,7 @@ pub async fn recursive_file_map<T, F>(
     sender: mpsc::Sender<T>,
     path: impl AsRef<Path> + 'async_recursion,
     mut max_depth: i16,
+    follow_symlinks: bool,
     map_fn: &'async_recursion dyn Fn(PathBuf) -> F,
 ) -> Result<(), std::io::Error>
 where
@@ -78,9 +79,14 @@ where
     while let Some(entry) = entries.next().await {
         let next_path = entry.as_ref().unwrap().path();
 
-        if next_path.is_dir().await {
+        let f_sym_meta = next_path.symlink_metadata().await?;
+        let f_type = f_sym_meta.file_type();
+        if f_type.is_symlink() && !follow_symlinks {
+            // return Err(std::io::Error::new(ErrorKind::Other, "follow symlinks disabled"));
+            continue;
+        } else if next_path.is_dir().await {
             if max_depth == 0 { return Ok(()) };
-            recursive_file_map(sender.clone(), next_path.as_path(), max_depth, &map_fn).await?;
+            recursive_file_map(sender.clone(), next_path.as_path(), max_depth, follow_symlinks, &map_fn).await?;
         } else {
             sender.send(map_fn(entry.unwrap().path()).await).unwrap();
         }
@@ -88,7 +94,7 @@ where
     Ok(())
 }
 
-pub async fn crawl_fs(path: impl AsRef<Path>, max_depth: i16) -> Result<Vec<PathBuf>, std::io::Error>
+pub async fn crawl_fs(path: impl AsRef<Path>, max_depth: i16, follow_symlinks: bool) -> Result<Vec<PathBuf>, std::io::Error>
 {
     let (sender, receiver): (Sender<PathBuf>, Receiver<PathBuf>)  = mpsc::channel();
     let mut file_vec = Vec::new();
@@ -100,7 +106,7 @@ pub async fn crawl_fs(path: impl AsRef<Path>, max_depth: i16) -> Result<Vec<Path
         file_vec
     });
 
-    let writer_handle = recursive_file_map(sender, &path, max_depth, &|d: PathBuf| async move {
+    let writer_handle = recursive_file_map(sender, &path, max_depth, follow_symlinks, &|d: PathBuf| async move {
         d
     });
 
@@ -164,6 +170,7 @@ where
 #[derive(Copy, Clone, Debug)]
 pub struct MD5HashFileOpts {
     pub max_depth: i16,
+    pub follow_symlinks: bool,
     pub read_buf_size: usize,
     pub sample_rate: u64,
     pub sample_threshold: u64,
@@ -177,8 +184,9 @@ where
 {
 
     let hash_fn = |e: PathBuf| async move {
+        let f_meta = e.metadata().await?;
+        let f_size = f_meta.len();
         let f_handle = File::open(&e).await?;
-        let f_size = f_handle.metadata().await?.len();
         let mut read_buf = vec![0; opts.read_buf_size];
         let mut buf_reader = BufReader::with_capacity(opts.read_buf_size, f_handle);
         let mut fdigest = md5::compute("");
@@ -224,8 +232,15 @@ mod test {
     #[test]
     fn test_dup_vec() {
         let path = Path::new("./test_fixtures");
-        let opts = MD5HashFileOpts{ max_depth: -1, read_buf_size: 256, sample_rate: 10, sample_threshold: 1024, batch_size: 2 };
-        let files = task::block_on(crawl_fs(path, opts.max_depth)).unwrap();
+        let opts = MD5HashFileOpts{
+            max_depth: -1,
+            follow_symlinks: false,
+            read_buf_size: 256,
+            sample_rate: 10,
+            sample_threshold: 1024,
+            batch_size: 2
+        };
+        let files = task::block_on(crawl_fs(path, opts.max_depth, false)).unwrap();
         let got = task::block_on(md5_hash_file_vec(files, opts, || {})).unwrap().duplicates().sort(SortOrder::Size);
         let want = r#"DupVec {
     inner: [
@@ -256,8 +271,15 @@ mod test {
     fn test_md5_hash_file_vec() {
         let path = Path::new("./test_fixtures");
         let max_depth = -1;
-        let files = task::block_on(crawl_fs(path, max_depth)).unwrap();
-        let opts = MD5HashFileOpts{ max_depth: -1, read_buf_size: 256, sample_rate: 10, sample_threshold: 1024, batch_size: 2 };
+        let files = task::block_on(crawl_fs(path, max_depth, false)).unwrap();
+        let opts = MD5HashFileOpts{
+            max_depth: -1,
+            follow_symlinks: false,
+            read_buf_size: 256,
+            sample_rate: 10,
+            sample_threshold: 1024,
+            batch_size: 2
+        };
         let got = task::block_on(md5_hash_file_vec(files, opts, || {})).unwrap();
         let mut tuples: Vec<(md5::Digest, Vec<PathBuf>)> = got.inner.into_iter().collect();
         tuples.sort_by(|a, b| format!("{:?}", a.1[0]).cmp(&format!("{:?}", b.1[0])));
@@ -309,10 +331,42 @@ mod test {
     fn test_crawl_fs() {
         let path = Path::new("./test_fixtures");
         let max_depth = -1;
-        let got = task::block_on(crawl_fs(path, max_depth)).unwrap();
+        let got = task::block_on(crawl_fs(path, max_depth, false)).unwrap();
         let want = r#"[
     PathBuf {
         inner: "./test_fixtures/alpha/a",
+    },
+    PathBuf {
+        inner: "./test_fixtures/alpha/b",
+    },
+    PathBuf {
+        inner: "./test_fixtures/alpha/bravo/charlie/c",
+    },
+    PathBuf {
+        inner: "./test_fixtures/alpha/bravo/charlie/d",
+    },
+    PathBuf {
+        inner: "./test_fixtures/alpha/bravo/charlie/b",
+    },
+    PathBuf {
+        inner: "./test_fixtures/alpha/bravo/d",
+    },
+]"#;
+        assert_eq!(want, format!("{:#?}", got));
+        // println!("{:#?}", got)
+    }
+
+    #[test]
+    fn test_crawl_fs_symlinks() {
+        let path = Path::new("./test_fixtures");
+        let max_depth = -1;
+        let got = task::block_on(crawl_fs(path, max_depth, true)).unwrap();
+        let want = r#"[
+    PathBuf {
+        inner: "./test_fixtures/alpha/a",
+    },
+    PathBuf {
+        inner: "./test_fixtures/alpha/la",
     },
     PathBuf {
         inner: "./test_fixtures/alpha/b",
