@@ -2,7 +2,9 @@ mod lib;
 use async_std::task;
 use structopt::StructOpt;
 use std::path::PathBuf;
-use indicatif::ProgressBar;
+use indicatif::{ProgressBar, ProgressStyle};
+use console::Term;
+use exitfailure::ExitFailure;
 
 #[derive(StructOpt, Debug)]
 struct Cli {
@@ -14,9 +16,8 @@ struct Cli {
     follow_symlinks: bool,
 }
 
-fn main() {
+fn main() -> Result<(), ExitFailure> {
     let args = Cli::from_args();
-    println!("{:?}", args);
     let opts = lib::MD5HashFileOpts{
         max_depth: args.max_depth,
         follow_symlinks: args.follow_symlinks,
@@ -26,22 +27,37 @@ fn main() {
         batch_size: 128,
     };
 
-    eprintln!("Reading file tree ...");
+    let term_err = Term::stderr();
+    let term_out = Term::stdout();
+
+    term_err.write_line("Reading file tree ...")?;
     let progress_crawling = ProgressBar::new_spinner();
     let files_to_hash = task::block_on(
         lib::crawl_fs(&args.path, opts.max_depth, opts.follow_symlinks, &mut move || {progress_crawling.inc(1)})).unwrap();
     let num_files = files_to_hash.len();
 
-    eprintln!("Generating check sums ...");
+    term_err.write_line("Generating check sums ...")?;
     let progress_hashing = ProgressBar::new(num_files as u64);
-    let hf = task::block_on( lib::md5_hash_file_vec(files_to_hash, opts, move || {progress_hashing.inc(1)})).unwrap();
+    progress_hashing.set_style(ProgressStyle::default_bar()
+        .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} {msg}")
+        .progress_chars("##-"));
+    let (hf, errors) = task::block_on( lib::md5_hash_file_vec(files_to_hash, opts, move || {progress_hashing.inc(1)})).unwrap();
     let results: lib::DupVec = hf.duplicates().sort(lib::SortOrder::Size);
 
-    eprintln!("Found duplicates ...");
+    if !errors.is_empty() {
+        term_err.write_line("Encountered errors ...")?;
+        for err in errors.iter() {
+            term_err.write_line(&format!("{}\n", err.to_string()))?;
+        }
+        term_out.write_line("")?;
+    }
+
+    term_err.write_line("Found duplicates ...")?;
     for res in results.into_inner().iter() {
         for duplicate in res.iter() {
-            println!("{}", duplicate.to_str().unwrap());
+            term_out.write_line(&format!("{}", duplicate.to_str().unwrap()))?;
         }
-        println!();
+        term_out.write_line("")?;
     }
+    Ok(())
 }

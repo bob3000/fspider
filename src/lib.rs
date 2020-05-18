@@ -123,7 +123,7 @@ where
 }
 
 pub async fn hash_file_vec<C, F, T>(mut files: Vec<PathBuf>, batch_size: u16, hash_fn: &dyn Fn(PathBuf) -> F, mut loop_cb: C,
-) -> Result<HashFNameMap<T>, std::io::Error>
+) -> Result<(HashFNameMap<T>, Vec<std::io::Error>), std::io::Error>
 where
     C: FnMut() + Send + Sync + 'static,
     T: Hash + Eq + Send + Sync,
@@ -132,9 +132,10 @@ where
     let num_files =  files.len();
     let mut files_processed: usize = 0;
     let mut hash_fname_map: HashFNameMap<T> = HashFNameMap::new();
+    let mut errors: Vec<std::io::Error> = Vec::new();
     let mut join_handle: Vec<F> = Vec::new();
 
-    async fn join_all<F, T>(handles: Vec<F>, hfm: &mut HashFNameMap<T>
+    async fn join_all<F, T>(handles: Vec<F>, hfm: &mut HashFNameMap<T>, errors: &mut Vec<std::io::Error>,
     ) -> Result<(), std::io::Error>
     where
         T: Hash + Eq + Send + Sync,
@@ -148,7 +149,7 @@ where
                     entry.push(file_hash.1.unwrap());
                 },
                 Err(e) => {
-                    eprintln!("{:?}", e);
+                    errors.push(e);
                 },
             };
         }
@@ -160,16 +161,16 @@ where
         loop_cb();
         join_handle.push(hash_fn(f));
         if files_processed % batch_size as usize == 0 {
-            join_all(join_handle, &mut hash_fname_map).await?;
+            join_all(join_handle, &mut hash_fname_map, &mut errors).await?;
             join_handle = Vec::new();
         }
     }
-    join_all(join_handle, &mut hash_fname_map).await?;
+    join_all(join_handle, &mut hash_fname_map, &mut errors).await?;
     for _ in 0..=num_files-files_processed {
         loop_cb();
     }
 
-    Ok(hash_fname_map)
+    Ok((hash_fname_map, errors))
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -183,7 +184,7 @@ pub struct MD5HashFileOpts {
 }
 
 pub async fn md5_hash_file_vec<C>(files: Vec<PathBuf>, opts: MD5HashFileOpts, loop_cb: C,
-) -> Result<HashFNameMap<md5::Digest>, std::io::Error>
+) -> Result<(HashFNameMap<md5::Digest>, Vec<std::io::Error>), std::io::Error>
 where
     C: FnMut() + Send + Sync + 'static,
 {
@@ -221,14 +222,14 @@ where
         Ok(FileHash(Some(fdigest), Some(e)))
     };
 
-    let mut hash_fname_map = hash_file_vec(files, opts.batch_size, &hash_fn, loop_cb).await?;
+    let (mut hash_fname_map, errors) = hash_file_vec(files, opts.batch_size, &hash_fn, loop_cb).await?;
     for v in hash_fname_map.inner.values_mut() {
         v.sort_by(|a, b| {
             a.partial_cmp(b).unwrap()
         });
     }
 
-    Ok(hash_fname_map)
+    Ok((hash_fname_map, errors))
 }
 
 mod test {
@@ -246,7 +247,7 @@ mod test {
             batch_size: 2
         };
         let files = task::block_on(crawl_fs(path, opts.max_depth, false, &mut || {})).unwrap();
-        let got = task::block_on(md5_hash_file_vec(files, opts, || {})).unwrap().duplicates().sort(SortOrder::Size);
+        let got = task::block_on(md5_hash_file_vec(files, opts, || {})).unwrap().0.duplicates().sort(SortOrder::Size);
         let want = r#"DupVec {
     inner: [
         [
@@ -285,7 +286,7 @@ mod test {
             sample_threshold: 1024,
             batch_size: 2
         };
-        let got = task::block_on(md5_hash_file_vec(files, opts, || {})).unwrap();
+        let got = task::block_on(md5_hash_file_vec(files, opts, || {})).unwrap().0;
         let mut tuples: Vec<(md5::Digest, Vec<PathBuf>)> = got.inner.into_iter().collect();
         tuples.sort_by(|a, b| format!("{:?}", a.1[0]).cmp(&format!("{:?}", b.1[0])));
         let want = r#"[
