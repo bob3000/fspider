@@ -7,6 +7,7 @@ use console::style;
 use exitfailure::ExitFailure;
 
 #[derive(StructOpt, Debug)]
+#[structopt(about = "Find duplicate files")]
 struct Cli {
     #[structopt(parse(from_os_str))]
     path: PathBuf,
